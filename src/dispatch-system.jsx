@@ -262,6 +262,8 @@ export default function App({ currentUser }) {
   const [woSearch, setWoSearch] = useState("");
   const [engSearch, setEngSearch] = useState("");
   const [commentDraft, setCommentDraft] = useState("");
+  const [woRecordId, setWoRecordId] = useState(null);
+  const [woTab, setWoTab] = useState("general");
   const [toast, setToast] = useState("");
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 3200); };
 
@@ -447,6 +449,9 @@ export default function App({ currentUser }) {
 
   // pull CRM bookings once data has loaded
   useEffect(() => { if (loaded) importFromCRM(); }, [loaded]);
+
+  // close any open work-order record when leaving the Work Orders tab
+  useEffect(() => { if (tab !== "workorders") setWoRecordId(null); }, [tab]);
 
   // write scheduling status back to the bridge so the CRM reflects it
   useEffect(() => {
@@ -993,7 +998,7 @@ export default function App({ currentUser }) {
               {rows.map((j) => (
                 <tr key={j.id} className="hover:bg-blue-50">
                   <td className="px-3 py-2.5 text-slate-300"><Circle size={13} /></td>
-                  <td className="px-3 py-2.5"><button onClick={() => setBookingId(j.id)} className="font-mono text-blue-700 hover:underline focus:outline-none">{j.wo || j.id}</button></td>
+                  <td className="px-3 py-2.5"><button onClick={() => { setWoRecordId(j.id); setWoTab("general"); setCommentDraft(""); }} className="font-mono text-blue-700 hover:underline focus:outline-none">{j.wo || j.id}</button></td>
                   <td className="px-3 py-2.5 text-slate-700">{custName(j.customerId)}</td>
                   <td className="px-3 py-2.5 text-slate-600">{cust(j.customerId)?.postcode || "—"}</td>
                   <td className="px-3 py-2.5"><Badge className={sysStatusClass(j.status)}>{sysStatus(j.status)}</Badge></td>
@@ -1014,6 +1019,157 @@ export default function App({ currentUser }) {
           </table>
         </div>
         <p className="text-xs text-slate-400">Work orders raised in the CRM appear here as <span className="font-medium text-amber-700">Open - Unscheduled</span> and on the schedule board's Unscheduled work. Use Refresh from CRM to pull the latest.</p>
+      </div>
+    );
+  }
+
+  function renderWorkOrderRecord() {
+    const j = jobs.find((x) => x.id === woRecordId);
+    if (!j) return <button onClick={() => setWoRecordId(null)} className="text-sm font-medium text-blue-700">← Back to Work Orders</button>;
+    const c = cust(j.customerId);
+    const engr = eng(j.engineerId);
+    const dur = jobDuration(j);
+    const stages = ["Work Order", "Schedule Work Order", "Close Work Order"];
+    const stageIdx = j.status === "Completed" ? 2 : j.status === "Unassigned" ? 0 : 1;
+    const closed = ["Completed", "Cancelled"].includes(j.status);
+    const F = (label, value) => (
+      <div className="border-b border-slate-100 py-1.5">
+        <div className="text-xs text-slate-400">{label}</div>
+        <div className="text-sm text-slate-700">{value || "—"}</div>
+      </div>
+    );
+    const tabBtn = (id, label) => (
+      <button key={id} onClick={() => setWoTab(id)} className={"whitespace-nowrap px-3 py-2.5 text-sm font-medium focus:outline-none " + (woTab === id ? "border-b-2 border-blue-600 text-blue-700" : "text-slate-500 hover:text-slate-700")}>{label}</button>
+    );
+    return (
+      <div className="space-y-3">
+        {/* command bar */}
+        <div className="flex flex-wrap items-center gap-2 rounded-t-lg border border-slate-200 bg-white px-3 py-2 shadow-sm">
+          <button onClick={() => setWoRecordId(null)} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><ArrowLeft size={15} /> Work Orders</button>
+          {!closed && <button onClick={() => advanceStatus(j.id)} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><ArrowRight size={15} /> Advance status</button>}
+          {!closed && <button onClick={() => { cancelJob(j.id); flash("Work order cancelled."); }} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-rose-600 hover:bg-rose-50"><X size={15} /> Cancel</button>}
+        </div>
+
+        {/* header */}
+        <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <Briefcase size={22} className="text-teal-600" />
+              <div>
+                <div className="font-mono text-lg font-semibold text-slate-800">{j.wo || j.id}</div>
+                <div className="text-xs text-slate-500">Work Order · {custName(j.customerId)}</div>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-5 text-left">
+              <div><div className="text-xs text-slate-400">System Status</div><Badge className={sysStatusClass(j.status)}>{sysStatus(j.status)}</Badge></div>
+              <div><div className="text-xs text-slate-400">Engineer</div><div className="text-sm font-medium text-slate-700">{engr?.name || "—"}</div></div>
+              <div><div className="text-xs text-slate-400">Promised</div><div className="text-sm font-medium text-slate-700">{fmtDate(j.date)} {j.time}</div></div>
+            </div>
+          </div>
+          {/* stage path */}
+          <div className="mt-4 flex items-center gap-2 overflow-x-auto">
+            {stages.map((s, idx) => (
+              <div key={s} className="flex shrink-0 items-center gap-2">
+                <span className={"flex items-center gap-1.5 rounded-full px-3 py-1 text-xs font-medium " + (idx === stageIdx ? "bg-blue-600 text-white" : idx < stageIdx ? "bg-blue-100 text-blue-700" : "bg-slate-100 text-slate-500")}>
+                  {idx < stageIdx ? <CheckCircle2 size={12} /> : <CircleDot size={12} />}{s}
+                </span>
+                {idx < stages.length - 1 && <ChevronRight size={14} className="text-slate-300" />}
+              </div>
+            ))}
+            {j.status === "Cancelled" && <Badge className="bg-slate-200 text-slate-500">Canceled</Badge>}
+          </div>
+        </div>
+
+        {/* tabs */}
+        <div className="rounded-lg border border-slate-200 bg-white shadow-sm">
+          <div className="flex gap-1 overflow-x-auto border-b border-slate-200 px-2">
+            {tabBtn("general", "General")}
+            {tabBtn("status", "Status Details")}
+            {tabBtn("notes", "Job Comments")}
+            {tabBtn("location", "Location")}
+          </div>
+
+          {woTab === "general" && (
+            <div className="grid grid-cols-1 gap-6 p-4 lg:grid-cols-3">
+              <div>
+                <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Key details</h4>
+                {F("Work Order Number", j.wo || j.id)}
+                {F("Customer Account", custName(j.customerId))}
+                {F("Work Order Type", `Gas ${j.type}`)}
+                {F("Trade", j.skill)}
+                {F("Priority", j.priority)}
+                {F("Engineer", engr?.name)}
+              </div>
+              <div>
+                <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Customer details</h4>
+                {F("Name", c?.name)}
+                {F("Address", c?.address)}
+                {F("Postcode", c?.postcode)}
+                {F("Phone", c?.phone)}
+                {F("Type", c?.type)}
+              </div>
+              <div>
+                <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Appointment slot</h4>
+                {F("Date", fmtDate(j.date))}
+                {F("Time", j.time)}
+                {F("Duration", dur + " min")}
+                {F("Description", j.notes)}
+              </div>
+            </div>
+          )}
+
+          {woTab === "status" && (
+            <div className="grid grid-cols-1 gap-6 p-4 lg:grid-cols-2">
+              <div>
+                <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Status</h4>
+                {F("System Status", sysStatus(j.status))}
+                {F("Internal Status", j.status)}
+                {F("Source", j.source === "CRM" ? "CRM booking" : "Created in dispatch")}
+              </div>
+              <div>
+                <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Scheduling</h4>
+                {F("Engineer", engr?.name)}
+                {F("Territory", engr?.area)}
+                {F("Scheduled date", fmtDate(j.date))}
+                {F("Scheduled time", j.time)}
+              </div>
+            </div>
+          )}
+
+          {woTab === "notes" && (
+            <div className="p-4">
+              <h4 className="mb-3 text-xs font-semibold uppercase tracking-wide text-slate-400">Job comments</h4>
+              <div className="flex items-start gap-2">
+                <textarea rows={2} value={commentDraft} onChange={(e) => setCommentDraft(e.target.value)} placeholder="Enter a note…" className="flex-1 rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" />
+                <button onClick={() => addComment(j.id, commentDraft)} disabled={!commentDraft.trim()} className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50">Add note</button>
+              </div>
+              <p className="mt-1 mb-4 text-xs text-slate-400">Posting as {userName}</p>
+              <div className="space-y-2">
+                {(j.comments || []).length === 0 && <p className="text-sm text-slate-400">No notes yet. Add the first one above.</p>}
+                {[...(j.comments || [])].reverse().map((cm, idx) => (
+                  <div key={idx} className="rounded-md border border-slate-200 p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-semibold text-slate-700">{cm.author}</span>
+                      <span className="text-xs text-slate-400">{fmtDateTime(cm.at)}</span>
+                    </div>
+                    <p className="mt-1 whitespace-pre-wrap text-sm text-slate-600">{cm.text}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {woTab === "location" && (
+            <div className="p-4">
+              <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Location</h4>
+              <div className="max-w-md">
+                {F("Address", c?.address)}
+                {F("Postcode", c?.postcode)}
+                {F("Scheduling territory", engr?.area || "—")}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -1497,7 +1653,7 @@ export default function App({ currentUser }) {
         <main className="flex-1 overflow-y-auto p-5">
           {tab === "dashboard" && renderDashboard()}
           {tab === "dispatch" && renderDispatch()}
-          {tab === "workorders" && renderWorkOrders()}
+          {tab === "workorders" && (woRecordId ? renderWorkOrderRecord() : renderWorkOrders())}
           {tab === "schedule" && renderSchedule()}
           {tab === "engineers" && renderEngineers()}
           {tab === "accounts" && renderAccounts()}
