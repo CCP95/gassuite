@@ -1,34 +1,41 @@
 import { StrictMode, useState, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
+import { supabase } from './supabaseClient.js'
 import Dispatch from './dispatch-system.jsx'
 import CRM from './gas-crm.jsx'
 
 /* ------------------------------------------------------------------ *
- *  window.storage shim — backs the apps' persistence with localStorage
+ *  window.storage — now backed by a shared Supabase table.
+ *  Both apps call window.storage; we don't touch their code.
+ *  Every signed-in user reads/writes the same rows = shared data.
  * ------------------------------------------------------------------ */
-if (!window.storage) {
-  window.storage = {
-    async get(key) { const v = localStorage.getItem(key); return v === null ? null : { key, value: v } },
-    async set(key, value) { localStorage.setItem(key, value); return { key, value } },
-    async delete(key) { localStorage.removeItem(key); return { key, deleted: true } },
-    async list(prefix = '') { return { keys: Object.keys(localStorage).filter(k => k.startsWith(prefix)) } },
-  }
+const TABLE = 'app_storage'
+window.storage = {
+  async get(key) {
+    try {
+      const { data, error } = await supabase.from(TABLE).select('value').eq('key', key).maybeSingle()
+      if (error || !data) return null
+      return { key, value: data.value }
+    } catch { return null }
+  },
+  async set(key, value) {
+    try { await supabase.from(TABLE).upsert({ key, value, updated_at: new Date().toISOString() }) } catch {}
+    return { key, value }
+  },
+  async delete(key) {
+    try { await supabase.from(TABLE).delete().eq('key', key) } catch {}
+    return { key, deleted: true }
+  },
+  async list(prefix = '') {
+    try {
+      const { data } = await supabase.from(TABLE).select('key').like('key', prefix + '%')
+      return { keys: (data || []).map((r) => r.key) }
+    } catch { return { keys: [] } }
+  },
 }
 
-/* ------------------------------------------------------------------ *
- *  DEMO AUTH  (front-end simulation — NOT real security)
- *  - users + session live in localStorage
- *  - "verification email" is shown on screen because there is no server
- *  - swap this layer for Supabase / Firebase / your own API for real auth
- * ------------------------------------------------------------------ */
-const USERS_KEY = 'gas-auth-users'
-const SESSION_KEY = 'gas-auth-session'
-
-const loadUsers = () => { try { return JSON.parse(localStorage.getItem(USERS_KEY)) || [] } catch { return [] } }
-const saveUsers = (u) => localStorage.setItem(USERS_KEY, JSON.stringify(u))
-const hash = (s) => { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return String(h) }
-const code6 = () => String(Math.floor(100000 + Math.random() * 900000))
+const REDIRECT = `${window.location.origin}${import.meta.env.BASE_URL}`
 
 /* --- inline styles --- */
 const S = {
@@ -39,71 +46,56 @@ const S = {
   label: { display: 'block', fontSize: 12, fontWeight: 600, color: '#64748b', margin: '12px 0 4px' },
   input: { width: '100%', boxSizing: 'border-box', padding: '10px 12px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 14, outline: 'none' },
   btn: { width: '100%', marginTop: 18, padding: '11px', borderRadius: 8, border: 'none', background: '#2563eb', color: '#fff', fontSize: 14, fontWeight: 600, cursor: 'pointer' },
+  btnDisabled: { opacity: .6, cursor: 'default' },
   link: { background: 'none', border: 'none', color: '#2563eb', fontWeight: 600, cursor: 'pointer', fontSize: 13, padding: 0 },
   err: { background: '#fee2e2', color: '#b91c1c', fontSize: 13, padding: '8px 10px', borderRadius: 8, marginTop: 12 },
   ok: { background: '#dcfce7', color: '#15803d', fontSize: 13, padding: '8px 10px', borderRadius: 8, marginTop: 12 },
-  mail: { marginTop: 16, border: '1px dashed #94a3b8', borderRadius: 8, padding: 12, background: '#f8fafc' },
+  note: { marginTop: 16, border: '1px dashed #94a3b8', borderRadius: 8, padding: 12, background: '#f8fafc', fontSize: 13, color: '#475569' },
 }
 
-function Auth({ onSignedIn }) {
-  const [screen, setScreen] = useState('login') // login | signup | verify
+function Auth() {
+  const [screen, setScreen] = useState('login') // login | signup | sent
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
-  const [codeInput, setCodeInput] = useState('')
-  const [pending, setPending] = useState(null)     // user awaiting verification
   const [err, setErr] = useState('')
   const [ok, setOk] = useState('')
+  const [busy, setBusy] = useState(false)
 
-  const reset = () => { setErr(''); setOk(''); setPassword(''); setConfirm(''); setCodeInput('') }
+  const reset = () => { setErr(''); setOk(''); setPassword(''); setConfirm('') }
 
-  const doSignup = () => {
+  const doSignup = async () => {
     setErr('')
     if (!name.trim() || !email.trim() || !password) return setErr('Please fill in every field.')
-    if (!/^\S+@\S+\.\S+$/.test(email)) return setErr('Enter a valid email address.')
     if (password.length < 6) return setErr('Password must be at least 6 characters.')
     if (password !== confirm) return setErr('Passwords do not match.')
-    const users = loadUsers()
-    if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) return setErr('An account with that email already exists.')
-    const user = { name: name.trim(), email: email.trim(), passHash: hash(password), verified: false, code: code6() }
-    saveUsers([...users, user])
-    setPending(user)
-    reset()
-    setScreen('verify')
+    setBusy(true)
+    const { error } = await supabase.auth.signUp({
+      email: email.trim(),
+      password,
+      options: { data: { name: name.trim() }, emailRedirectTo: REDIRECT },
+    })
+    setBusy(false)
+    if (error) return setErr(error.message)
+    setScreen('sent')
   }
 
-  const doVerify = () => {
+  const doLogin = async () => {
     setErr('')
-    const users = loadUsers()
-    const u = users.find((x) => x.email.toLowerCase() === pending.email.toLowerCase())
-    if (!u) return setErr('Account not found.')
-    if (codeInput.trim() !== u.code) return setErr('That code is not correct.')
-    u.verified = true
-    saveUsers(users)
-    reset()
-    setScreen('login')
-    setOk('Email verified — your account is active. Please sign in.')
+    setBusy(true)
+    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password })
+    setBusy(false)
+    if (error) {
+      if (/confirm/i.test(error.message)) return setErr('Please confirm your email first — check your inbox for the verification link.')
+      return setErr('Incorrect email or password.')
+    }
   }
 
-  const resend = () => {
-    const users = loadUsers()
-    const u = users.find((x) => x.email.toLowerCase() === pending.email.toLowerCase())
-    if (!u) return
-    u.code = code6()
-    saveUsers(users)
-    setPending({ ...u })
-    setOk('A new code has been sent.')
-  }
-
-  const doLogin = () => {
-    setErr('')
-    const users = loadUsers()
-    const u = users.find((x) => x.email.toLowerCase() === email.toLowerCase())
-    if (!u || u.passHash !== hash(password)) return setErr('Incorrect email or password.')
-    if (!u.verified) { setPending(u); setScreen('verify'); setErr(''); setOk('Please verify your email to activate the account.'); return }
-    localStorage.setItem(SESSION_KEY, JSON.stringify({ email: u.email, name: u.name }))
-    onSignedIn({ email: u.email, name: u.name })
+  const resend = async () => {
+    setErr(''); setOk('')
+    const { error } = await supabase.auth.resend({ type: 'signup', email: email.trim(), options: { emailRedirectTo: REDIRECT } })
+    if (error) setErr(error.message); else setOk('Verification email sent again.')
   }
 
   return (
@@ -123,7 +115,7 @@ function Auth({ onSignedIn }) {
               <input style={S.input} type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && doLogin()} />
               {err && <div style={S.err}>{err}</div>}
               {ok && <div style={S.ok}>{ok}</div>}
-              <button style={S.btn} onClick={doLogin}>Sign in</button>
+              <button style={{ ...S.btn, ...(busy ? S.btnDisabled : {}) }} disabled={busy} onClick={doLogin}>{busy ? 'Signing in…' : 'Sign in'}</button>
               <p style={{ marginTop: 16, fontSize: 13, color: '#64748b' }}>
                 No account? <button style={S.link} onClick={() => { reset(); setScreen('signup') }}>Create one</button>
               </p>
@@ -142,33 +134,25 @@ function Auth({ onSignedIn }) {
               <label style={S.label}>Confirm password</label>
               <input style={S.input} type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} />
               {err && <div style={S.err}>{err}</div>}
-              <button style={S.btn} onClick={doSignup}>Create account</button>
+              <button style={{ ...S.btn, ...(busy ? S.btnDisabled : {}) }} disabled={busy} onClick={doSignup}>{busy ? 'Creating…' : 'Create account'}</button>
               <p style={{ marginTop: 16, fontSize: 13, color: '#64748b' }}>
                 Already registered? <button style={S.link} onClick={() => { reset(); setScreen('login') }}>Sign in</button>
               </p>
             </>
           )}
 
-          {screen === 'verify' && pending && (
+          {screen === 'sent' && (
             <>
-              <h2 style={{ margin: '0 0 4px', fontSize: 18, color: '#0f172a' }}>Verify your email</h2>
-              <p style={{ fontSize: 13, color: '#64748b', margin: '4px 0 0' }}>
-                We sent a 6-digit verification code to <b>{pending.email}</b>. Enter it below to activate your account.
-              </p>
-              <div style={S.mail}>
-                <div style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: .5 }}>Demo email — no mail server</div>
-                <div style={{ fontSize: 13, color: '#475569', marginTop: 4 }}>Your verification code is:</div>
-                <div style={{ fontSize: 26, fontWeight: 700, letterSpacing: 4, color: '#1b5297', marginTop: 2 }}>{pending.code}</div>
+              <h2 style={{ margin: '0 0 4px', fontSize: 18, color: '#0f172a' }}>Check your email</h2>
+              <div style={S.note}>
+                We've sent a verification link to <b>{email}</b>. Click it to activate your account, then come back and sign in.
+                <br /><br />It can take a minute, and may land in your spam folder.
               </div>
-              <label style={S.label}>Verification code</label>
-              <input style={S.input} value={codeInput} onChange={(e) => setCodeInput(e.target.value)} placeholder="000000" onKeyDown={(e) => e.key === 'Enter' && doVerify()} />
               {err && <div style={S.err}>{err}</div>}
               {ok && <div style={S.ok}>{ok}</div>}
-              <button style={S.btn} onClick={doVerify}>Verify &amp; activate</button>
+              <button style={S.btn} onClick={() => { reset(); setScreen('login') }}>Back to sign in</button>
               <p style={{ marginTop: 16, fontSize: 13, color: '#64748b' }}>
-                Didn't get it? <button style={S.link} onClick={resend}>Resend code</button>
-                {'  ·  '}
-                <button style={S.link} onClick={() => { reset(); setScreen('login') }}>Back to sign in</button>
+                Didn't get it? <button style={S.link} onClick={resend}>Resend link</button>
               </p>
             </>
           )}
@@ -178,11 +162,9 @@ function Auth({ onSignedIn }) {
   )
 }
 
-/* ------------------------------------------------------------------ *
- *  Authed shell: app switcher + sign out
- * ------------------------------------------------------------------ */
-function Suite({ user, onSignOut }) {
+function Suite({ user }) {
   const [app, setApp] = useState('dispatch')
+  const name = user.user_metadata?.name || user.email
   const tab = (id, label) => (
     <button onClick={() => setApp(id)}
       style={{ padding: '6px 14px', borderRadius: 6, border: 'none', cursor: 'pointer', fontWeight: 600, fontSize: 13,
@@ -194,8 +176,8 @@ function Suite({ user, onSignOut }) {
         {tab('dispatch', 'Dispatch system')}
         {tab('crm', 'CRM')}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ color: '#cbd5e1', fontSize: 13 }}>{user.name || user.email}</span>
-          <button onClick={onSignOut}
+          <span style={{ color: '#cbd5e1', fontSize: 13 }}>{name}</span>
+          <button onClick={() => supabase.auth.signOut()}
             style={{ padding: '5px 12px', borderRadius: 6, border: '1px solid #334155', background: 'transparent', color: '#e2e8f0', fontSize: 13, fontWeight: 600, cursor: 'pointer' }}>
             Sign out
           </button>
@@ -207,20 +189,17 @@ function Suite({ user, onSignOut }) {
 }
 
 function Root() {
-  const [user, setUser] = useState(null)
+  const [session, setSession] = useState(null)
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    try { const s = JSON.parse(localStorage.getItem(SESSION_KEY)); if (s && s.email) setUser(s) } catch {}
-    setReady(true)
+    supabase.auth.getSession().then(({ data }) => { setSession(data.session); setReady(true) })
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s))
+    return () => sub.subscription.unsubscribe()
   }, [])
 
-  const signOut = () => { localStorage.removeItem(SESSION_KEY); setUser(null) }
-
   if (!ready) return null
-  return user
-    ? <Suite user={user} onSignOut={signOut} />
-    : <Auth onSignedIn={setUser} />
+  return session ? <Suite user={session.user} /> : <Auth />
 }
 
 createRoot(document.getElementById('root')).render(
