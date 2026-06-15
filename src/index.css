@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+/* Undo Vite's starter styles so the apps fill the window */
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100vh;
+}
+
+body {
+  display: block;   /* Vite centers everything with flex by default */
+  background: #f3f2f2;
+}
+
+#root {
+  max-width: none;  /* Vite caps this at 1280px */
+  text-align: left;
+}
