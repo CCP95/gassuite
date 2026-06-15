@@ -255,7 +255,7 @@ export default function App({ currentUser }) {
   const [certFilter, setCertFilter] = useState("All");
   const [scheduleDate, setScheduleDate] = useState(relDate(0));
   const [bookingId, setBookingId] = useState(null);
-  const [autoOn, setAutoOn] = useState(false);
+  const [autoOn, setAutoOn] = useState(true);
   const [lastRun, setLastRun] = useState(null);
   const [accountId, setAccountId] = useState(null);
   const [accSearch, setAccSearch] = useState("");
@@ -269,6 +269,7 @@ export default function App({ currentUser }) {
 
   const { engineers, customers, jobs, certs } = data;
   const STORE_KEY = "flueline-dispatch-v2";
+  const syncedStore = useRef(null); // last value known to be in the DB (prevents echo loops)
 
   // load
   useEffect(() => {
@@ -277,7 +278,7 @@ export default function App({ currentUser }) {
       try {
         if (typeof window !== "undefined" && window.storage) {
           const res = await window.storage.get(STORE_KEY);
-          if (active && res && res.value) setData(JSON.parse(res.value));
+          if (active && res && res.value) { syncedStore.current = res.value; setData(JSON.parse(res.value)); }
         }
       } catch (e) { /* no saved data yet */ }
       if (active) setLoaded(true);
@@ -285,17 +286,31 @@ export default function App({ currentUser }) {
     return () => { active = false; };
   }, []);
 
-  // save
+  // save (skip if unchanged or if this exact value just came in from the DB)
   useEffect(() => {
     if (!loaded) return;
+    const s = JSON.stringify(data);
+    if (s === syncedStore.current) return;
+    syncedStore.current = s;
     (async () => {
-      try {
-        if (typeof window !== "undefined" && window.storage) {
-          await window.storage.set(STORE_KEY, JSON.stringify(data));
-        }
-      } catch (e) { /* storage unavailable in this preview */ }
+      try { if (typeof window !== "undefined" && window.storage) await window.storage.set(STORE_KEY, s); } catch (e) {}
     })();
   }, [data, loaded]);
+
+  // live updates from other signed-in users
+  useEffect(() => {
+    if (!loaded || !(window.storage && window.storage.subscribe)) return;
+    const reloadStore = async () => {
+      try {
+        const r = await window.storage.get(STORE_KEY);
+        const v = r && r.value;
+        if (v && v !== syncedStore.current) { syncedStore.current = v; setData(JSON.parse(v)); }
+      } catch (e) {}
+    };
+    const unsubStore = window.storage.subscribe(STORE_KEY, reloadStore);
+    const unsubBridge = window.storage.subscribe(BRIDGE_KEY, () => importFromCRM());
+    return () => { unsubStore && unsubStore(); unsubBridge && unsubBridge(); };
+  }, [loaded]);
 
   // keep latest data/day available to the interval callback
   const dataRef = useRef(data);
@@ -961,7 +976,6 @@ export default function App({ currentUser }) {
       <div className="space-y-3">
         {/* command bar */}
         <div className="flex flex-wrap items-center gap-2 rounded-t-lg border border-slate-200 bg-white px-3 py-2 shadow-sm">
-          <button onClick={() => openModal("job")} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><Plus size={15} /> New</button>
           <button onClick={syncFromCRM} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><RotateCw size={15} /> Refresh from CRM</button>
           <div className="relative ml-auto">
             <Search size={14} className="pointer-events-none absolute left-2.5 top-2.5 text-slate-400" />
@@ -1598,12 +1612,9 @@ export default function App({ currentUser }) {
   /* ------------------------------ shell ---------------------------- */
   const nav = [
     { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
-    { id: "dispatch", label: "Dispatch board", icon: ClipboardList },
-    { id: "workorders", label: "Work Orders", icon: Briefcase },
     { id: "schedule", label: "Schedule board", icon: CalendarRange },
+    { id: "workorders", label: "Work Orders", icon: Briefcase },
     { id: "engineers", label: "Engineers", icon: Wrench },
-    { id: "accounts", label: "Accounts", icon: Building2 },
-    { id: "certs", label: "Certificates", icon: FileCheck2 },
   ];
   const titles = { dashboard: "Dashboard", dispatch: "Dispatch board", workorders: "Work Orders", schedule: "Schedule board", engineers: "Engineers", accounts: "Accounts", certs: "Gas safety certificates" };
 

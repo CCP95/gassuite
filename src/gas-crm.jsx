@@ -1,13 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Home, Building2, User, Users, Target, Wrench, Search, Settings, Bell,
   HelpCircle, LayoutGrid, Plus, ChevronDown, ChevronRight, Phone, Mail,
   Globe, MapPin, Calendar, Clock, CheckCircle2, Circle, Star, X, ArrowLeft,
-  Pencil, PhoneCall, PoundSterling, FileText, Send, Briefcase, StickyNote,
+  Pencil, PhoneCall, PoundSterling, FileText, Send, Briefcase, StickyNote, Trash2,
 } from "lucide-react";
 
 /* ------------------------------ constants ----------------------------- */
-const OWNERS = ["Alex Carter", "Nadia Khan", "Joe Brennan"];
 const ACCOUNT_TYPES = ["Domestic customer", "Landlord / Agent", "Commercial"];
 const RATINGS = ["Hot", "Warm", "Cold"];
 const OPP_STAGES = ["Qualification", "Needs analysis", "Proposal", "Negotiation", "Closed won", "Closed lost"];
@@ -31,6 +30,7 @@ const NAV = ["home", "accounts", "contacts", "opportunities", "workorders"];
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const relDate = (d) => new Date(Date.now() + d * 86400000).toISOString().slice(0, 10);
 const fmtDate = (iso) => (iso ? new Date(iso).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "—");
+const fmtDateTime = (iso) => (iso ? new Date(iso).toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "—");
 const gbp = (n) => "£" + Number(n || 0).toLocaleString("en-GB");
 const seqId = (prefix, arr, pad = 5) => prefix + "-" + String(arr.length + 1).padStart(pad, "0");
 // Work order numbers: 11 digits — "18" + a random 9-digit suffix (e.g. 18493027815)
@@ -90,7 +90,8 @@ const prioClass = (p) => ({ Emergency: "bg-rose-100 text-rose-700", High: "bg-am
 const ratingClass = (r) => ({ Hot: "bg-rose-100 text-rose-700", Warm: "bg-amber-100 text-amber-800", Cold: "bg-sky-100 text-sky-700" }[r]);
 
 /* ================================== App ================================= */
-export default function App() {
+export default function App({ currentUser }) {
+  const userName = currentUser || "You";
   const [data, setData] = useState(seed());
   const [loaded, setLoaded] = useState(false);
   const [route, setRoute] = useState({ object: "home", id: null });
@@ -103,6 +104,8 @@ export default function App() {
   const STORE_KEY = "gas-crm-v2";
 
   const { accounts, contacts, opportunities, workorders, activities } = data;
+  const syncedStore = useRef(null);
+  const syncedBridge = useRef(null);
 
   useEffect(() => {
     let on = true;
@@ -110,16 +113,21 @@ export default function App() {
       try {
         if (typeof window !== "undefined" && window.storage) {
           const r = await window.storage.get(STORE_KEY);
-          if (on && r && r.value) setData(JSON.parse(r.value));
+          if (on && r && r.value) { syncedStore.current = r.value; setData(JSON.parse(r.value)); }
         }
       } catch (e) { /* nothing stored yet */ }
       if (on) setLoaded(true);
     })();
     return () => { on = false; };
   }, []);
+
+  // save (skip if unchanged / if it just came in from the DB)
   useEffect(() => {
     if (!loaded) return;
-    (async () => { try { if (window.storage) await window.storage.set(STORE_KEY, JSON.stringify(data)); } catch (e) {} })();
+    const s = JSON.stringify(data);
+    if (s === syncedStore.current) return;
+    syncedStore.current = s;
+    (async () => { try { if (window.storage) await window.storage.set(STORE_KEY, s); } catch (e) {} })();
   }, [data, loaded]);
 
   // publish CRM work orders to the shared bridge (preserving dispatch's fields)
@@ -143,36 +151,60 @@ export default function App() {
             description: w.description, subject: w.subject, crmStatus: w.status,
           };
         });
-        await window.storage.set(BRIDGE_KEY, JSON.stringify(Object.values(byWo)));
+        const out = JSON.stringify(Object.values(byWo));
+        if (out !== syncedBridge.current) { syncedBridge.current = out; await window.storage.set(BRIDGE_KEY, out); }
       } catch (e) {}
     })();
   }, [workorders, loaded]);
 
-  // read scheduling status back from dispatch once loaded
+  // pull dispatch scheduling status back into the CRM (only updates if changed)
+  const pullDispatch = async () => {
+    try {
+      if (!window.storage) return;
+      const r = await window.storage.get(BRIDGE_KEY).catch(() => null);
+      if (!r || !r.value) return;
+      const byWo = Object.fromEntries(JSON.parse(r.value).map((b) => [b.wo, b]));
+      const map = { Unassigned: "Unscheduled", Assigned: "Scheduled", "En route": "Scheduled", "In progress": "In progress", Completed: "Completed", Cancelled: "Cancelled" };
+      setData((d) => {
+        let changed = false;
+        const wos = d.workorders.map((w) => {
+          const b = byWo[w.id];
+          const ds = b && b.dispatchStatus && map[b.dispatchStatus];
+          if (ds && ds !== w.status) { changed = true; return { ...w, status: ds }; }
+          return w;
+        });
+        return changed ? { ...d, workorders: wos } : d;
+      });
+    } catch (e) {}
+  };
+  useEffect(() => { if (loaded) pullDispatch(); }, [loaded]);
+
+  // live updates from other signed-in users
   useEffect(() => {
-    if (!loaded) return;
-    (async () => {
+    if (!loaded || !(window.storage && window.storage.subscribe)) return;
+    const reloadStore = async () => {
       try {
-        if (!window.storage) return;
-        const r = await window.storage.get(BRIDGE_KEY).catch(() => null);
-        if (!r || !r.value) return;
-        const byWo = Object.fromEntries(JSON.parse(r.value).map((b) => [b.wo, b]));
-        const map = { Unassigned: "Unscheduled", Assigned: "Scheduled", "En route": "Scheduled", "In progress": "In progress", Completed: "Completed", Cancelled: "Cancelled" };
-        setData((d) => ({
-          ...d,
-          workorders: d.workorders.map((w) => {
-            const b = byWo[w.id];
-            const ds = b && b.dispatchStatus && map[b.dispatchStatus];
-            return ds && ds !== w.status ? { ...w, status: ds } : w;
-          }),
-        }));
+        const r = await window.storage.get(STORE_KEY);
+        const v = r && r.value;
+        if (v && v !== syncedStore.current) { syncedStore.current = v; setData(JSON.parse(v)); }
       } catch (e) {}
-    })();
+    };
+    const unsubStore = window.storage.subscribe(STORE_KEY, reloadStore);
+    const unsubBridge = window.storage.subscribe(BRIDGE_KEY, () => pullDispatch());
+    return () => { unsubStore && unsubStore(); unsubBridge && unsubBridge(); };
   }, [loaded]);
 
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 3200); };
   const go = (object) => { setRoute({ object, id: null }); setQ(""); };
   const open = (object, id) => { setRoute({ object, id }); setRecordTab("related"); };
+  const deleteAccount = (id) =>
+    setData((d) => ({
+      ...d,
+      accounts: d.accounts.filter((a) => a.id !== id),
+      contacts: d.contacts.filter((c) => c.accountId !== id),
+      opportunities: d.opportunities.filter((o) => o.accountId !== id),
+      workorders: d.workorders.filter((w) => w.accountId !== id),
+    }));
 
   /* lookups */
   const acc = (id) => accounts.find((a) => a.id === id);
@@ -183,7 +215,7 @@ export default function App() {
   /* ------------------------------ create / edit --------------------------- */
   const setF = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
   const defaults = {
-    accounts: { name: "", type: ACCOUNT_TYPES[0], industry: "", phone: "", website: "", address: "", postcode: "", owner: OWNERS[0], rating: "Warm" },
+    accounts: { name: "", type: ACCOUNT_TYPES[0], industry: "", phone: "", website: "", address: "", postcode: "", owner: "", rating: "Warm" },
     contacts: { accountId: accounts[0]?.id || "", name: "", title: "", email: "", phone: "" },
     opportunities: { accountId: accounts[0]?.id || "", name: "", stage: OPP_STAGES[0], amount: 0, closeDate: relDate(30) },
     workorders: { accountId: accounts[0]?.id || "", contactId: null, subject: "", type: "Repair", skill: "Boilers", priority: "Routine", status: "Unscheduled", requestedDate: relDate(0), requestedTime: "09:00", durationMin: 60, description: "" },
@@ -201,6 +233,8 @@ export default function App() {
       const arr = d[object];
       if (_editId) return { ...d, [object]: arr.map((r) => (r.id === _editId ? { ...r, ...rest } : r)) };
       const rec = { ...rest, id: object === "workorders" ? nextWoNumber(arr) : seqId(idPrefix[object], arr) };
+      if (object === "accounts") rec.owner = userName;
+      if (object === "workorders") rec.createdBy = userName;
       if (object === "opportunities") rec.amount = Number(rec.amount) || 0;
       if (object === "workorders") rec.durationMin = Number(rec.durationMin) || 60;
       return { ...d, [object]: [rec, ...arr] };
@@ -210,7 +244,7 @@ export default function App() {
     else flash(`${OBJ[object]?.singular || "Record"} saved.`);
   };
   const saveActivity = () => {
-    const rec = { ...draft, id: "ACT-" + Math.random().toString(36).slice(2, 7), recordId: route.id };
+    const rec = { ...draft, id: "ACT-" + Math.random().toString(36).slice(2, 7), recordId: route.id, author: userName, at: new Date().toISOString() };
     setData((d) => ({ ...d, activities: [rec, ...d.activities] }));
     setModal(null);
   };
@@ -384,6 +418,11 @@ export default function App() {
           { label: "Raise booking", icon: Briefcase, primary: true, onClick: () => raiseBooking(r.id) },
           { label: "New contact", icon: Plus, onClick: () => openCreate("contacts", { accountId: r.id, _lock: true }) },
           { label: "Edit", icon: Pencil, onClick: () => openEdit("accounts", r) },
+          { label: "Delete account", icon: Trash2, danger: true, onClick: () => {
+            if (window.confirm(`Delete ${r.name}?\n\nThis also removes its contacts, opportunities and work orders, and cannot be undone.`)) {
+              deleteAccount(r.id); go("accounts"); flash("Account deleted.");
+            }
+          } },
         ],
         details: [
           ["Account name", r.name], ["Type", r.type], ["Industry", r.industry], ["Phone", r.phone],
@@ -428,7 +467,7 @@ export default function App() {
         ...(!["Completed", "Cancelled"].includes(r.status) ? [{ label: "Cancel work order", icon: X, danger: true, onClick: () => { setWOStatus(r.id, "Cancelled"); flash("Work order cancelled."); } }] : []),
       ],
       details: [
-        ["Subject", r.subject], ["Account", accName(r.accountId)], ["Contact", conName(r.contactId)], ["Type", r.type], ["Trade", r.skill || "—"],
+        ["Subject", r.subject], ["Account", accName(r.accountId)], ["Contact", conName(r.contactId)], ["Type", r.type], ["Trade", r.skill || "—"], ["Created by", r.createdBy || "—"],
         ["Priority", r.priority], ["Status", r.status], ["Requested date", fmtDate(r.requestedDate)], ["Requested time", r.requestedTime],
         ["Duration", r.durationMin + " min"], ["Description", r.description || "—"],
       ],
@@ -554,7 +593,7 @@ export default function App() {
                   </button>
                   <div className="min-w-0">
                     <div className="text-sm text-slate-700">{a.subject}</div>
-                    <div className="text-xs text-slate-400">{a.type} · {fmtDate(a.date)}</div>
+                    <div className="text-xs text-slate-400">{a.type}{a.author ? ` · ${a.author}` : ""} · {a.at ? fmtDateTime(a.at) : fmtDate(a.date)}</div>
                   </div>
                 </div>
               ))}
@@ -588,10 +627,8 @@ export default function App() {
           <Field label="Postcode"><input className={inputCls} value={draft.postcode} onChange={(e) => setF("postcode", e.target.value)} /></Field>
           <Field label="Website"><input className={inputCls} value={draft.website} onChange={(e) => setF("website", e.target.value)} /></Field>
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Owner"><select className={inputCls} value={draft.owner} onChange={(e) => setF("owner", e.target.value)}>{OWNERS.map((o) => <option key={o}>{o}</option>)}</select></Field>
-          <Field label="Rating"><select className={inputCls} value={draft.rating} onChange={(e) => setF("rating", e.target.value)}>{RATINGS.map((o) => <option key={o}>{o}</option>)}</select></Field>
-        </div>
+        <Field label="Rating"><select className={inputCls} value={draft.rating} onChange={(e) => setF("rating", e.target.value)}>{RATINGS.map((o) => <option key={o}>{o}</option>)}</select></Field>
+        <p className="text-xs text-slate-500">Owner will be set to <span className="font-medium text-slate-700">{userName}</span>.</p>
       </Modal>
     );
 
@@ -673,11 +710,11 @@ export default function App() {
       {/* global header */}
       <div className="flex items-center gap-3 border-b border-slate-200 bg-white px-3 py-2">
         <button className="rounded p-1.5 text-slate-500 hover:bg-slate-100" aria-label="App launcher"><LayoutGrid size={18} /></button>
-        <div className="relative flex-1 max-w-xl">
+        <div className="relative ml-auto w-72 max-w-full">
           <Search size={15} className="pointer-events-none absolute left-3 top-2.5 text-slate-400" />
           <input value={globalQ} onChange={(e) => setGlobalQ(e.target.value)} placeholder="Search Salesforce" className="w-full rounded-md border border-slate-200 bg-slate-50 py-2 pl-9 pr-3 text-sm focus:border-blue-500 focus:bg-white focus:outline-none focus:ring-2 focus:ring-blue-500" />
           {globalResults.length > 0 && (
-            <div className="absolute z-40 mt-1 w-full overflow-hidden rounded-md border border-slate-200 bg-white shadow-lg">
+            <div className="absolute right-0 z-40 mt-1 w-full overflow-hidden rounded-md border border-slate-200 bg-white shadow-lg">
               {globalResults.map(({ o, r }, i) => (
                 <button key={i} onClick={() => { open(o, r.id); setGlobalQ(""); }} className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-slate-50">
                   <Tile object={o} size={14} /><span className="truncate text-slate-700">{r.name || r.subject || r.id}</span>
@@ -691,7 +728,6 @@ export default function App() {
           <button className="rounded p-1.5 hover:bg-slate-100"><HelpCircle size={18} /></button>
           <button className="rounded p-1.5 hover:bg-slate-100"><Settings size={18} /></button>
           <button className="rounded p-1.5 hover:bg-slate-100"><Bell size={18} /></button>
-          <span className="ml-1 flex h-8 w-8 items-center justify-center rounded-full bg-blue-600 text-sm font-semibold text-white">AC</span>
         </div>
       </div>
 
