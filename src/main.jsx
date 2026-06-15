@@ -183,7 +183,7 @@ function Suite({ user }) {
           </button>
         </div>
       </div>
-      {app === 'dispatch' ? <Dispatch /> : <CRM />}
+      {app === 'dispatch' ? <Dispatch currentUser={name} /> : <CRM currentUser={name} />}
     </div>
   )
 }

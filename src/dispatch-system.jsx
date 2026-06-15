@@ -32,6 +32,8 @@ const addMonths = (iso, m) => {
 const daysUntil = (iso) => Math.ceil((Date.parse(iso) - Date.now()) / DAY);
 const fmtDate = (iso) =>
   iso ? new Date(iso).toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" }) : "—";
+const fmtDateTime = (iso) =>
+  iso ? new Date(iso).toLocaleString("en-GB", { day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "—";
 const isToday = (iso) => iso === new Date().toISOString().slice(0, 10);
 const certStatus = (expiry) => {
   const d = daysUntil(expiry);
@@ -241,7 +243,8 @@ function Modal({ title, onClose, children, footer }) {
 }
 
 /* ------------------------------- App ---------------------------------- */
-export default function App() {
+export default function App({ currentUser }) {
+  const userName = currentUser || "You";
   const [tab, setTab] = useState("dashboard");
   const [data, setData] = useState(seed());
   const [loaded, setLoaded] = useState(false);
@@ -258,6 +261,7 @@ export default function App() {
   const [accSearch, setAccSearch] = useState("");
   const [woSearch, setWoSearch] = useState("");
   const [engSearch, setEngSearch] = useState("");
+  const [commentDraft, setCommentDraft] = useState("");
   const [toast, setToast] = useState("");
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 3200); };
 
@@ -369,6 +373,17 @@ export default function App() {
       ...d,
       jobs: d.jobs.map((j) => (j.id === jobId ? { ...j, status: "Cancelled" } : j)),
     }));
+
+  const addComment = (jobId, text) => {
+    const t = text.trim();
+    if (!t) return;
+    setData((d) => ({
+      ...d,
+      jobs: d.jobs.map((j) =>
+        j.id === jobId ? { ...j, comments: [...(j.comments || []), { author: userName, text: t, at: new Date().toISOString() }] } : j),
+    }));
+    setCommentDraft("");
+  };
 
   const changeDuration = (jobId, delta) =>
     setData((d) => ({
@@ -857,11 +872,11 @@ export default function App() {
     return (
       <Modal
         title={`WO ${j.wo || j.id} · ${custName(j.customerId)}`}
-        onClose={() => setBookingId(null)}
+        onClose={() => { setBookingId(null); setCommentDraft(""); }}
         footer={
           <>
-            <button onClick={() => { unscheduleJob(j.id); setBookingId(null); }} className="rounded-md border border-rose-200 px-3 py-2 text-sm font-medium text-rose-600 hover:bg-rose-50 focus:outline-none focus:ring-2 focus:ring-rose-400">Unschedule</button>
-            <button onClick={() => setBookingId(null)} className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500">Done</button>
+            <button onClick={() => { unscheduleJob(j.id); setBookingId(null); setCommentDraft(""); }} className="rounded-md border border-rose-200 px-3 py-2 text-sm font-medium text-rose-600 hover:bg-rose-50 focus:outline-none focus:ring-2 focus:ring-rose-400">Unschedule</button>
+            <button onClick={() => { setBookingId(null); setCommentDraft(""); }} className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500">Done</button>
           </>
         }
       >
@@ -891,6 +906,40 @@ export default function App() {
               </button>
             )}
           </div>
+        </div>
+
+        {/* job notes */}
+        <div className="border-t border-slate-100 pt-3">
+          <span className="mb-2 block text-xs font-medium text-slate-500">Job notes</span>
+          <div className="mb-2 max-h-44 space-y-2 overflow-y-auto">
+            {(j.comments || []).length === 0 && <p className="text-xs text-slate-400">No notes yet.</p>}
+            {(j.comments || []).map((c, idx) => (
+              <div key={idx} className="rounded-md bg-slate-50 p-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-semibold text-slate-700">{c.author}</span>
+                  <span className="text-xs text-slate-400">{fmtDateTime(c.at)}</span>
+                </div>
+                <p className="mt-0.5 whitespace-pre-wrap text-sm text-slate-600">{c.text}</p>
+              </div>
+            ))}
+          </div>
+          <div className="flex items-start gap-2">
+            <textarea
+              rows={2}
+              value={commentDraft}
+              onChange={(e) => setCommentDraft(e.target.value)}
+              placeholder="Add a note…"
+              className="flex-1 rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+            <button
+              onClick={() => addComment(j.id, commentDraft)}
+              disabled={!commentDraft.trim()}
+              className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+            >
+              Add
+            </button>
+          </div>
+          <p className="mt-1 text-xs text-slate-400">Posting as {userName}</p>
         </div>
       </Modal>
     );
