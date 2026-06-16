@@ -24,7 +24,7 @@ const OBJ = {
   opportunities: { label: "Opportunities", singular: "Opportunity", icon: Target, color: "#d9a31e" },
   workorders: { label: "Work Orders", singular: "Work Order", icon: Wrench, color: "#0d9488" },
 };
-const NAV = ["home", "accounts", "contacts", "opportunities", "workorders"];
+const NAV = ["home", "accounts", "contacts"];
 
 /* -------------------------------- utils -------------------------------- */
 const todayISO = () => new Date().toISOString().slice(0, 10);
@@ -155,7 +155,7 @@ export default function App({ currentUser }) {
         if (out !== syncedBridge.current) { syncedBridge.current = out; await window.storage.set(BRIDGE_KEY, out); }
       } catch (e) {}
     })();
-  }, [workorders, loaded]);
+  }, [workorders, accounts, loaded]);
 
   // pull dispatch scheduling status back into the CRM (only updates if changed)
   const pullDispatch = async () => {
@@ -197,7 +197,18 @@ export default function App({ currentUser }) {
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 3200); };
   const go = (object) => { setRoute({ object, id: null }); setQ(""); };
   const open = (object, id) => { setRoute({ object, id }); setRecordTab("related"); };
-  const deleteAccount = (id) =>
+  const deleteAccount = async (id) => {
+    const wos = workorders.filter((w) => w.accountId === id).map((w) => w.id);
+    // flag this account's work orders in the bridge so dispatch removes them
+    if (window.storage && wos.length) {
+      try {
+        const r = await window.storage.get(BRIDGE_KEY).catch(() => null);
+        if (r && r.value) {
+          const arr = JSON.parse(r.value).map((b) => (wos.includes(b.wo) ? { ...b, crmStatus: "Cancelled", removed: true } : b));
+          await window.storage.set(BRIDGE_KEY, JSON.stringify(arr));
+        }
+      } catch (e) {}
+    }
     setData((d) => ({
       ...d,
       accounts: d.accounts.filter((a) => a.id !== id),
@@ -205,6 +216,7 @@ export default function App({ currentUser }) {
       opportunities: d.opportunities.filter((o) => o.accountId !== id),
       workorders: d.workorders.filter((w) => w.accountId !== id),
     }));
+  };
 
   /* lookups */
   const acc = (id) => accounts.find((a) => a.id === id);
@@ -229,19 +241,34 @@ export default function App({ currentUser }) {
   const idPrefix = { accounts: "ACC", contacts: "CON", opportunities: "OPP", workorders: "WO" };
   const saveRecord = (object) => {
     const { _editId, _lock, ...rest } = draft;
+    let bookingAccount = null, bookingNote = null;
     setData((d) => {
       const arr = d[object];
       if (_editId) return { ...d, [object]: arr.map((r) => (r.id === _editId ? { ...r, ...rest } : r)) };
       const rec = { ...rest, id: object === "workorders" ? nextWoNumber(arr) : seqId(idPrefix[object], arr) };
       if (object === "accounts") rec.owner = userName;
-      if (object === "workorders") rec.createdBy = userName;
+      if (object === "workorders") { rec.createdBy = userName; rec.durationMin = Number(rec.durationMin) || 60; }
       if (object === "opportunities") rec.amount = Number(rec.amount) || 0;
-      if (object === "workorders") rec.durationMin = Number(rec.durationMin) || 60;
-      return { ...d, [object]: [rec, ...arr] };
+      let next = { ...d, [object]: [rec, ...arr] };
+      // raising a booking logs a note on the account and queues it for dispatch
+      if (object === "workorders" && !_editId) {
+        bookingAccount = rec.accountId;
+        bookingNote = {
+          id: "ACT-" + Math.random().toString(36).slice(2, 7), recordId: rec.accountId, type: "Note",
+          subject: `Booking raised — WO ${rec.id}: ${rec.subject || rec.type} (${rec.type} · ${rec.skill}, ${rec.priority}) for ${fmtDate(rec.requestedDate)} ${rec.requestedTime}`,
+          author: userName, at: new Date().toISOString(), done: true,
+        };
+        next = { ...next, activities: [bookingNote, ...next.activities] };
+      }
+      return next;
     });
     setModal(null);
-    if (object === "workorders" && !_editId) { flash("Work order created — queued as Unscheduled for dispatch."); open("workorders", null); }
-    else flash(`${OBJ[object]?.singular || "Record"} saved.`);
+    if (object === "workorders" && !_editId) {
+      flash("Booking raised — sent to dispatch and logged on the account.");
+      if (bookingAccount) open("accounts", bookingAccount);
+    } else {
+      flash(`${OBJ[object]?.singular || "Record"} saved.`);
+    }
   };
   const saveActivity = () => {
     const rec = { ...draft, id: "ACT-" + Math.random().toString(36).slice(2, 7), recordId: route.id, author: userName, at: new Date().toISOString() };
@@ -249,22 +276,19 @@ export default function App({ currentUser }) {
     setModal(null);
   };
   const toggleActivity = (id) => setData((d) => ({ ...d, activities: d.activities.map((a) => (a.id === id ? { ...a, done: !a.done } : a)) }));
+  const deleteActivity = (id) => setData((d) => ({ ...d, activities: d.activities.filter((a) => a.id !== id) }));
   const setWOStatus = (id, status) => setData((d) => ({ ...d, workorders: d.workorders.map((w) => (w.id === id ? { ...w, status } : w)) }));
 
   /* ================================ HOME ================================= */
   function renderHome() {
-    const openWO = workorders.filter((w) => !["Completed", "Cancelled"].includes(w.status));
-    const unsched = workorders.filter((w) => w.status === "Unscheduled");
-    const openOpps = opportunities.filter((o) => !o.stage.startsWith("Closed"));
-    const pipeline = openOpps.reduce((s, o) => s + (o.amount || 0), 0);
     const tasks = activities.filter((a) => a.type === "Task" && !a.done);
-    const byStage = OPP_STAGES.filter((s) => !s.startsWith("Closed")).map((s) => ({ s, v: openOpps.filter((o) => o.stage === s).reduce((x, o) => x + o.amount, 0) }));
-    const maxStage = Math.max(1, ...byStage.map((x) => x.v));
+    const recent = accounts.slice(0, 6);
+    const hot = accounts.filter((a) => a.rating === "Hot").length;
     const kpis = [
-      { label: "Open work orders", value: openWO.length, color: "#0d9488" },
-      { label: "Unscheduled (to dispatch)", value: unsched.length, color: "#e11d48" },
-      { label: "Open opportunities", value: openOpps.length, color: "#d9a31e" },
-      { label: "Pipeline value", value: gbp(pipeline), color: "#1b5297" },
+      { label: "Accounts", value: accounts.length, color: "#e8730f" },
+      { label: "Contacts", value: contacts.length, color: "#7c53e8" },
+      { label: "Hot accounts", value: hot, color: "#e11d48" },
+      { label: "Open tasks", value: tasks.length, color: "#1b5297" },
     ];
     return (
       <div className="space-y-4">
@@ -279,46 +303,32 @@ export default function App({ currentUser }) {
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
           <div className="rounded-lg border border-slate-200 bg-white shadow-sm lg:col-span-2">
             <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-              <div className="flex items-center gap-2"><Tile object="workorders" size={20} /><h3 className="text-sm font-semibold text-slate-700">Unscheduled work — ready for dispatch</h3></div>
-              <Pill className="bg-rose-100 text-rose-700">{unsched.length}</Pill>
+              <div className="flex items-center gap-2"><Tile object="accounts" size={20} /><h3 className="text-sm font-semibold text-slate-700">Recent accounts</h3></div>
+              <button onClick={() => go("accounts")} className="text-xs font-medium text-blue-700 hover:underline">View all</button>
             </div>
             <div className="divide-y divide-slate-100">
-              {unsched.length === 0 && <p className="px-4 py-6 text-sm text-slate-400">Nothing waiting. New work orders appear here until dispatched.</p>}
-              {unsched.map((w) => (
-                <button key={w.id} onClick={() => open("workorders", w.id)} className="flex w-full items-center justify-between px-4 py-2.5 text-left hover:bg-slate-50">
+              {recent.length === 0 && <p className="px-4 py-6 text-sm text-slate-400">No accounts yet. Create one from the Accounts tab.</p>}
+              {recent.map((a) => (
+                <button key={a.id} onClick={() => open("accounts", a.id)} className="flex w-full items-center justify-between px-4 py-2.5 text-left hover:bg-slate-50">
                   <div className="min-w-0">
-                    <div className="truncate text-sm font-medium text-blue-700">{w.subject}</div>
-                    <div className="font-mono text-xs text-slate-400">{w.id} · {accName(w.accountId)} · {fmtDate(w.requestedDate)} {w.requestedTime}</div>
+                    <div className="truncate text-sm font-medium text-blue-700">{a.name}</div>
+                    <div className="text-xs text-slate-400">{a.type} · {a.postcode}</div>
                   </div>
-                  <div className="flex items-center gap-2"><Pill className={prioClass(w.priority)}>{w.priority}</Pill><Pill className={woStatusClass(w.status)}>{w.status}</Pill></div>
+                  <Pill className={ratingClass(a.rating)}>{a.rating}</Pill>
                 </button>
               ))}
             </div>
-            <div className="border-t border-slate-100 px-4 py-2 text-xs text-slate-400">These sync to the Dispatch schedule board's Unscheduled queue.</div>
           </div>
-          <div className="space-y-4">
-            <div className="rounded-lg border border-slate-200 bg-white shadow-sm">
-              <div className="border-b border-slate-200 px-4 py-3"><h3 className="text-sm font-semibold text-slate-700">Pipeline by stage</h3></div>
-              <div className="space-y-2 p-4">
-                {byStage.map((x) => (
-                  <div key={x.s}>
-                    <div className="mb-0.5 flex justify-between text-xs text-slate-500"><span>{x.s}</span><span className="font-medium text-slate-700">{gbp(x.v)}</span></div>
-                    <div className="h-2 rounded-full bg-slate-100"><div className="h-2 rounded-full" style={{ width: (x.v / maxStage) * 100 + "%", background: "#1b5297" }} /></div>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div className="rounded-lg border border-slate-200 bg-white shadow-sm">
-              <div className="border-b border-slate-200 px-4 py-3"><h3 className="text-sm font-semibold text-slate-700">My open tasks</h3></div>
-              <div className="divide-y divide-slate-100">
-                {tasks.length === 0 && <p className="px-4 py-4 text-xs text-slate-400">No open tasks.</p>}
-                {tasks.map((t) => (
-                  <div key={t.id} className="flex items-center gap-2 px-4 py-2.5">
-                    <button onClick={() => toggleActivity(t.id)} className="text-slate-300 hover:text-emerald-500"><Circle size={15} /></button>
-                    <div className="min-w-0 flex-1"><div className="truncate text-sm text-slate-700">{t.subject}</div><div className="text-xs text-slate-400">Due {fmtDate(t.date)}</div></div>
-                  </div>
-                ))}
-              </div>
+          <div className="rounded-lg border border-slate-200 bg-white shadow-sm">
+            <div className="border-b border-slate-200 px-4 py-3"><h3 className="text-sm font-semibold text-slate-700">My open tasks</h3></div>
+            <div className="divide-y divide-slate-100">
+              {tasks.length === 0 && <p className="px-4 py-4 text-xs text-slate-400">No open tasks.</p>}
+              {tasks.map((t) => (
+                <div key={t.id} className="flex items-center gap-2 px-4 py-2.5">
+                  <button onClick={() => toggleActivity(t.id)} className="text-slate-300 hover:text-emerald-500"><Circle size={15} /></button>
+                  <div className="min-w-0 flex-1"><div className="truncate text-sm text-slate-700">{t.subject}</div><div className="text-xs text-slate-400">Due {fmtDate(t.date)}</div></div>
+                </div>
+              ))}
             </div>
           </div>
         </div>
@@ -409,8 +419,6 @@ export default function App({ currentUser }) {
   function recordConfig(object, r) {
     if (object === "accounts") {
       const cs = contacts.filter((c) => c.accountId === r.id);
-      const os = opportunities.filter((o) => o.accountId === r.id);
-      const ws = workorders.filter((w) => w.accountId === r.id);
       return {
         title: r.name, subtitle: r.type,
         highlights: [["Type", r.type], ["Phone", r.phone], ["Owner", r.owner], ["Rating", r.rating]],
@@ -430,19 +438,16 @@ export default function App({ currentUser }) {
         ],
         related: [
           { object: "contacts", title: "Contacts", rows: cs, line: (c) => [c.name, c.title] },
-          { object: "opportunities", title: "Opportunities", rows: os, line: (o) => [o.name, `${o.stage} · ${gbp(o.amount)}`] },
-          { object: "workorders", title: "Work Orders", rows: ws, line: (w) => [w.subject, `${w.status} · ${fmtDate(w.requestedDate)}`] },
         ],
       };
     }
     if (object === "contacts") {
-      const ws = workorders.filter((w) => w.contactId === r.id);
       return {
         title: r.name, subtitle: r.title,
         highlights: [["Account", accName(r.accountId)], ["Title", r.title], ["Phone", r.phone], ["Email", r.email]],
         actions: [{ label: "Edit", icon: Pencil, onClick: () => openEdit("contacts", r) }],
         details: [["Name", r.name], ["Title", r.title], ["Account", accName(r.accountId)], ["Phone", r.phone], ["Email", r.email]],
-        related: [{ object: "workorders", title: "Related Work Orders", rows: ws, line: (w) => [w.subject, w.status] }],
+        related: [],
       };
     }
     if (object === "opportunities") {
@@ -587,14 +592,17 @@ export default function App({ currentUser }) {
             <div className="space-y-3 p-4">
               {acts.length === 0 && <p className="text-xs text-slate-400">No activity logged yet. Use the buttons above.</p>}
               {acts.map((a) => (
-                <div key={a.id} className="flex gap-2">
+                <div key={a.id} className="group flex gap-2">
                   <button onClick={() => a.type === "Task" && toggleActivity(a.id)} className={"mt-0.5 shrink-0 " + (a.done ? "text-emerald-500" : "text-slate-300")}>
                     {a.done ? <CheckCircle2 size={15} /> : <Circle size={15} />}
                   </button>
-                  <div className="min-w-0">
+                  <div className="min-w-0 flex-1">
                     <div className="text-sm text-slate-700">{a.subject}</div>
                     <div className="text-xs text-slate-400">{a.type}{a.author ? ` · ${a.author}` : ""} · {a.at ? fmtDateTime(a.at) : fmtDate(a.date)}</div>
                   </div>
+                  <button onClick={() => deleteActivity(a.id)} title="Delete activity" className="mt-0.5 shrink-0 rounded p-1 text-slate-300 hover:bg-rose-50 hover:text-rose-600 focus:outline-none focus:ring-2 focus:ring-rose-400">
+                    <Trash2 size={14} />
+                  </button>
                 </div>
               ))}
             </div>

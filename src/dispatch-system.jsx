@@ -385,11 +385,21 @@ export default function App({ currentUser }) {
       jobs: d.jobs.map((j) => (j.id === jobId ? { ...j, engineerId: null, status: "Unassigned" } : j)),
     }));
 
-  const cancelJob = (jobId) =>
-    setData((d) => ({
-      ...d,
-      jobs: d.jobs.map((j) => (j.id === jobId ? { ...j, status: "Cancelled" } : j)),
-    }));
+  const cancelJob = async (jobId) => {
+    const job = jobs.find((j) => j.id === jobId);
+    // mark the bridge so it won't be re-imported, and the CRM sees it cancelled
+    if (job && job.wo && window.storage) {
+      try {
+        const r = await window.storage.get(BRIDGE_KEY).catch(() => null);
+        if (r && r.value) {
+          const arr = JSON.parse(r.value);
+          const b = arr.find((x) => x.wo === job.wo);
+          if (b) { b.dispatchStatus = "Cancelled"; await window.storage.set(BRIDGE_KEY, JSON.stringify(arr)); }
+        }
+      } catch (e) {}
+    }
+    setData((d) => ({ ...d, jobs: d.jobs.filter((j) => j.id !== jobId) }));
+  };
 
   const addComment = (jobId, text) => {
     const t = text.trim();
@@ -428,9 +438,24 @@ export default function App({ currentUser }) {
       const bridge = JSON.parse(r.value);
       let added = 0;
       setData((d) => {
-        const custs = [...d.customers];
+        const custs = d.customers.map((c) => ({ ...c }));
         const have = new Set(d.jobs.map((j) => j.wo).filter(Boolean));
-        const cancelled = new Set(bridge.filter((b) => b.crmStatus === "Cancelled").map((b) => b.wo));
+        const removed = new Set(bridge.filter((b) => b.crmStatus === "Cancelled" || b.removed).map((b) => b.wo));
+        // refresh existing customers' details from the CRM (latest address/postcode/phone)
+        let custChanged = false;
+        bridge.forEach((b) => {
+          if (!b.account) return;
+          const c = custs.find((x) => x.name === b.account);
+          if (!c) return;
+          const type = b.accountType?.startsWith("Land") ? "Landlord" : b.accountType?.startsWith("Comm") ? "Commercial" : "Domestic";
+          if ((b.address && b.address !== c.address) || (b.postcode && b.postcode !== c.postcode) || (b.phone && b.phone !== c.phone) || (b.accountType && type !== c.type)) {
+            if (b.address) c.address = b.address;
+            if (b.postcode) c.postcode = b.postcode;
+            if (b.phone) c.phone = b.phone;
+            if (b.accountType) c.type = type;
+            custChanged = true;
+          }
+        });
         const newJobs = [];
         bridge.forEach((b) => {
           if (!b.wo || have.has(b.wo) || b.dispatchStatus) return;
@@ -450,10 +475,10 @@ export default function App({ currentUser }) {
           });
           have.add(b.wo);
         });
-        // reflect CRM cancellations onto existing jobs
-        const reconciled = d.jobs.map((j) => (j.wo && cancelled.has(j.wo) && j.status !== "Cancelled" ? { ...j, status: "Cancelled" } : j));
+        // remove jobs whose CRM work order was cancelled or its account deleted
+        const reconciled = d.jobs.filter((j) => !(j.wo && removed.has(j.wo)));
         added = newJobs.length;
-        const changed = added > 0 || reconciled.some((j, i) => j !== d.jobs[i]);
+        const changed = custChanged || added > 0 || reconciled.length !== d.jobs.length;
         if (!changed) return d;
         return { ...d, customers: custs, jobs: [...newJobs, ...reconciled] };
       });
@@ -464,6 +489,12 @@ export default function App({ currentUser }) {
 
   // pull CRM bookings once data has loaded
   useEffect(() => { if (loaded) importFromCRM(); }, [loaded]);
+
+  // one-time cleanup: cancelling now deletes, so remove any legacy cancelled jobs
+  useEffect(() => {
+    if (!loaded) return;
+    setData((d) => (d.jobs.some((j) => j.status === "Cancelled") ? { ...d, jobs: d.jobs.filter((j) => j.status !== "Cancelled") } : d));
+  }, [loaded]);
 
   // close any open work-order record when leaving the Work Orders tab
   useEffect(() => { if (tab !== "workorders") setWoRecordId(null); }, [tab]);
@@ -857,26 +888,48 @@ export default function App({ currentUser }) {
                 <h3 className="text-sm font-semibold text-slate-700">Unscheduled work</h3>
                 <span className="rounded-full bg-rose-100 px-2 text-xs text-rose-700">{unscheduled.length}</span>
               </div>
-              <span className="text-xs text-slate-400">Drag a job onto an engineer's row to book it.</span>
+              <span className="text-xs text-slate-400">Drag a row onto an engineer's row to book it.</span>
             </div>
-            <div className="flex gap-2 overflow-x-auto p-3">
-              {unscheduled.length === 0 && <p className="w-full py-4 text-center text-xs text-slate-400">Everything is scheduled.</p>}
-              {unscheduled.map((j) => (
-                <div
-                  key={j.id}
-                  draggable
-                  onDragStart={(ev) => ev.dataTransfer.setData("text/plain", j.id)}
-                  className="w-60 shrink-0 cursor-grab rounded-md border border-slate-200 bg-slate-50 p-2 active:cursor-grabbing"
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="flex min-w-0 items-center gap-1 text-xs font-medium text-slate-700"><GripVertical size={12} className="shrink-0 text-slate-300" /><span className="truncate">{custName(j.customerId)}</span></span>
-                    <Badge className={priorityClass(j.priority)}>{j.priority}</Badge>
-                  </div>
-                  <div className="mt-0.5 font-mono text-xs text-slate-400">WO {j.wo || "—"}</div>
-                  <div className="mt-1 truncate text-xs text-slate-500">{j.type} · {j.skill} · {jobDuration(j)}m</div>
-                  <div className="truncate text-xs text-slate-400">{cust(j.customerId)?.postcode} · req. {fmtDate(j.date)}</div>
-                </div>
-              ))}
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="border-b border-slate-200 bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  <tr>
+                    <th className="w-8 px-3 py-2"></th>
+                    <th className="px-3 py-2 font-medium">Work Order</th>
+                    <th className="px-3 py-2 font-medium">Customer</th>
+                    <th className="px-3 py-2 font-medium">Address</th>
+                    <th className="px-3 py-2 font-medium">Postcode</th>
+                    <th className="px-3 py-2 font-medium">Trade</th>
+                    <th className="px-3 py-2 font-medium">Duration</th>
+                    <th className="px-3 py-2 font-medium">Priority</th>
+                    <th className="px-3 py-2 font-medium">Requested</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {unscheduled.length === 0 && <tr><td colSpan={9} className="px-4 py-6 text-center text-xs text-slate-400">Everything is scheduled.</td></tr>}
+                  {unscheduled.map((j) => {
+                    const c = cust(j.customerId);
+                    return (
+                      <tr
+                        key={j.id}
+                        draggable
+                        onDragStart={(ev) => ev.dataTransfer.setData("text/plain", j.id)}
+                        className="cursor-grab hover:bg-blue-50 active:cursor-grabbing"
+                      >
+                        <td className="px-3 py-2.5 text-slate-300"><GripVertical size={14} /></td>
+                        <td className="px-3 py-2.5 font-mono text-xs text-slate-500">{j.wo || j.id}</td>
+                        <td className="px-3 py-2.5 font-medium text-slate-800">{custName(j.customerId)}</td>
+                        <td className="px-3 py-2.5 text-slate-600">{c?.address || "—"}</td>
+                        <td className="px-3 py-2.5 text-slate-600">{c?.postcode || "—"}</td>
+                        <td className="px-3 py-2.5 text-slate-600">{j.skill}</td>
+                        <td className="px-3 py-2.5 text-slate-600">{jobDuration(j)} min</td>
+                        <td className="px-3 py-2.5"><Badge className={priorityClass(j.priority)}>{j.priority}</Badge></td>
+                        <td className="px-3 py-2.5 text-slate-600">{fmtDate(j.date)} {j.time}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
@@ -970,7 +1023,7 @@ export default function App({ currentUser }) {
     const list = jobs.filter((j) =>
       !term || (j.wo || "").includes(term) || custName(j.customerId).toLowerCase().includes(term) ||
       (cust(j.customerId)?.postcode || "").toLowerCase().includes(term) || j.skill.toLowerCase().includes(term));
-    const active = list.filter((j) => j.status !== "Completed");
+    const active = list.filter((j) => j.status !== "Completed" && j.status !== "Cancelled");
     const rows = [...active, ...list.filter((j) => j.status === "Completed")];
     return (
       <div className="space-y-3">
@@ -1061,7 +1114,7 @@ export default function App({ currentUser }) {
         <div className="flex flex-wrap items-center gap-2 rounded-t-lg border border-slate-200 bg-white px-3 py-2 shadow-sm">
           <button onClick={() => setWoRecordId(null)} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><ArrowLeft size={15} /> Work Orders</button>
           {!closed && <button onClick={() => advanceStatus(j.id)} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><ArrowRight size={15} /> Advance status</button>}
-          {!closed && <button onClick={() => { cancelJob(j.id); flash("Work order cancelled."); }} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-rose-600 hover:bg-rose-50"><X size={15} /> Cancel</button>}
+          {!closed && <button onClick={() => { cancelJob(j.id); flash("Work order cancelled."); setWoRecordId(null); }} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-rose-600 hover:bg-rose-50"><X size={15} /> Cancel</button>}
         </div>
 
         {/* header */}
