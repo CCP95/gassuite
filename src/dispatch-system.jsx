@@ -5,6 +5,7 @@ import {
   CircleDot, ArrowRight, ShieldCheck, RotateCw, Search, Calendar,
   CalendarRange, ChevronLeft, ChevronRight, GripVertical, Minus,
   Building2, ArrowLeft, UserPlus, Mail, Briefcase, ChevronDown, Circle,
+  Settings, Trash2, Map, Car,
 } from "lucide-react";
 
 /* ----------------------------- constants ----------------------------- */
@@ -55,6 +56,16 @@ const minToTime = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${Strin
 const snap15 = (m) => Math.round(m / 15) * 15;
 const jobDuration = (j) => j.durationMin || (j.type === "Service" ? 90 : 60);
 
+/* ----------------------------- time slots ---------------------------- */
+const SLOTS = [
+  { id: "AM", label: "Morning · 08:00–12:00", short: "08:00–12:00", start: 8, end: 12, time: "08:00" },
+  { id: "PM", label: "Afternoon · 13:00–18:00", short: "13:00–18:00", start: 13, end: 18, time: "13:00" },
+];
+const slotById = (id) => SLOTS.find((s) => s.id === id) || SLOTS[0];
+const slotOf = (j) => j.slot || (timeToMin(j.time) < 12 * 60 + 30 ? "AM" : "PM");
+const shiftHours = (e) => ({ start: parseInt((e.shiftStart || "07:00").split(":")[0], 10), end: parseInt((e.shiftEnd || "19:00").split(":")[0], 10) });
+const shiftOverlapsSlot = (e, slotId) => { const sh = shiftHours(e); const sl = slotById(slotId); return sh.start < sl.end && sh.end > sl.start; };
+
 /* -------------------- travel estimation (London) --------------------- */
 // Approximate coordinates for specific outward codes seen in the data,
 // with a prefix-based fallback so any London postcode resolves to something.
@@ -91,78 +102,45 @@ const distKm = (a, b) => {
   const s = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(s));
 };
-const travelMin = (a, b) => Math.max(10, Math.round((distKm(a, b) / 22) * 60)); // ~22 km/h urban avg
+const travelMin = (a, b) => { if (!a || !b) return 12; return Math.max(5, Math.round((distKm(a, b) / 35) * 60) + 5); }; // real coords → ~35 km/h + buffer
 
-// Pure scheduler: returns a new jobs array plus counts. Greedy insertion
-// heuristic — priority order, skill match, earliest feasible slot allowing
-// travel between consecutive jobs, with a light load-balancing penalty.
+// Slot-based scheduler: places unscheduled jobs (for the given day) into the
+// morning or afternoon slot of a skilled engineer whose shift covers that slot,
+// preferring the requested slot and load-balancing across engineers.
 function planSchedule(d, day) {
   const onShift = d.engineers.filter((e) => e.status !== "Off shift");
-  const plan = {};
-  onShift.forEach((e) => {
-    plan[e.id] = d.jobs
-      .filter((j) => j.engineerId === e.id && j.date === day && j.status !== "Cancelled")
-      .map((j) => {
-        const c = d.customers.find((x) => x.id === j.customerId);
-        const start = timeToMin(j.time);
-        return { start, end: start + jobDuration(j), coord: pcCoord(c?.postcode) };
-      })
-      .sort((a, b) => a.start - b.start);
-  });
+  const load = {};
+  onShift.forEach((e) => { load[e.id] = { AM: 0, PM: 0 }; });
+  d.jobs
+    .filter((j) => j.date === day && j.engineerId && !["Cancelled", "Unassigned"].includes(j.status))
+    .forEach((j) => { if (load[j.engineerId]) load[j.engineerId][slotOf(j)]++; });
+
   const rank = { Emergency: 0, High: 1, Routine: 2 };
   const queue = d.jobs
-    .filter((j) => j.status === "Unassigned")
+    .filter((j) => j.status === "Unassigned" && j.date === day)
     .sort((a, b) => (rank[a.priority] - rank[b.priority]) || (timeToMin(a.time) - timeToMin(b.time)));
 
   const assignments = {};
   let assigned = 0, unplaceable = 0;
-
   for (const job of queue) {
-    const c = d.customers.find((x) => x.id === job.customerId);
-    const loc = pcCoord(c?.postcode);
-    const dur = jobDuration(job);
-    const reqRaw = timeToMin(job.time);
-    const req = Math.max(WIN_START * 60, Math.min(reqRaw, WIN_END * 60 - dur));
+    const slotId = slotOf(job); // respect the booked slot — don't move AM↔PM
+    const terrId = jobTerritoryId(job, d.customers, d.territories);
+    const cands = onShift.filter((e) => (e.skills || []).includes(job.skill) && shiftOverlapsSlot(e, slotId) && territoryOk(e, terrId, d.territories));
     let best = null;
-
-    for (const e of onShift) {
-      if (!e.skills.includes(job.skill)) continue;
-      const bookings = plan[e.id];
-      const load = bookings.length;
-      let prevEnd = WIN_START * 60, prevCoord = areaCoord(e.area);
-      for (let i = 0; i <= bookings.length; i++) {
-        const next = bookings[i];
-        const earliest = prevEnd + travelMin(prevCoord, loc);
-        const desired = Math.max(earliest, req);
-        const latestStart = next ? next.start - travelMin(loc, next.coord) - dur : WIN_END * 60 - dur;
-        if (desired <= latestStart && desired + dur <= WIN_END * 60) {
-          const added = travelMin(prevCoord, loc) + (next ? travelMin(loc, next.coord) - travelMin(prevCoord, next.coord) : 0);
-          const score = added + 2 * load;
-          if (!best || score < best.score || (score === best.score && desired < best.start)) {
-            best = { engId: e.id, start: desired, score };
-          }
-        }
-        if (next) { prevEnd = next.end; prevCoord = next.coord; }
-      }
-    }
-
-    if (best) {
-      assignments[job.id] = best;
-      plan[best.engId] = [...plan[best.engId], { start: best.start, end: best.start + dur, coord: loc }].sort((a, b) => a.start - b.start);
-      assigned++;
-    } else unplaceable++;
+    if (cands.length) { cands.sort((a, b) => load[a.id][slotId] - load[b.id][slotId]); best = { engId: cands[0].id, slotId }; }
+    if (best) { assignments[job.id] = best; load[best.engId][best.slotId]++; assigned++; }
+    else unplaceable++;
   }
-
   const jobs = d.jobs.map((j) =>
     assignments[j.id]
-      ? { ...j, engineerId: assignments[j.id].engId, time: minToTime(assignments[j.id].start), date: day, status: "Assigned" }
+      ? { ...j, engineerId: assignments[j.id].engId, slot: assignments[j.id].slotId, time: slotById(assignments[j.id].slotId).time, date: day, status: "Assigned" }
       : j);
   return { jobs, assigned, unplaceable };
 }
 
 /* ------------------------------- seed --------------------------------- */
 function seed() {
-  return { engineers: [], customers: [], jobs: [], certs: [] };
+  return { engineers: [], customers: [], jobs: [], certs: [], territories: [] };
 }
 
 /* --------------------------- color helpers ---------------------------- */
@@ -194,6 +172,30 @@ const blockClass = (s) =>
 // Shared key both apps read/write (works when run together locally; the two
 // apps share the same browser localStorage). Sandboxed previews run isolated.
 const BRIDGE_KEY = "gas-bridge-workorders-v2";
+const TERRITORY_KEY = "gas-territories-v1";
+
+/* ------------------------- scheduling territories -------------------- */
+const outwardArea = (pc) => (pc || "").trim().toUpperCase().split(/\s+/)[0]; // e.g. "SK1"
+const outwardPrefix = (a) => (a.match(/^[A-Z]+/) || [""])[0];                 // e.g. "SK"
+const territoryForPostcode = (pc, territories) => {
+  const area = outwardArea(pc);
+  if (!area) return null;
+  const pref = outwardPrefix(area);
+  return (territories || []).find((t) =>
+    (t.postcodes || []).some((p) => { const P = (p || "").trim().toUpperCase(); return P && (area === P || pref === P || area.startsWith(P)); })
+  ) || null;
+};
+const jobTerritoryId = (job, customers, territories) => {
+  const c = customers.find((x) => x.id === job.customerId);
+  const t = territoryForPostcode(c?.postcode, territories);
+  return t ? t.id : null;
+};
+// true if the engineer may take a job in the given territory
+const territoryOk = (eng, jobTerrId, territories) => {
+  if (!territories || territories.length === 0) return true; // none configured → no restriction
+  if (!jobTerrId) return true;                               // job postcode not in any territory
+  return eng.territoryId === jobTerrId;
+};
 const sysStatus = (s) => ({
   Unassigned: "Open - Unscheduled",
   Assigned: "Open - Scheduled",
@@ -242,6 +244,56 @@ function Modal({ title, onClose, children, footer }) {
   );
 }
 
+/* ----------------------- live territory map -------------------------- */
+// Loads Leaflet from CDN on demand and plots each postcode district on an
+// OpenStreetMap basemap. Uses circle markers (no image icons) to stay simple.
+function loadLeaflet() {
+  return new Promise((resolve) => {
+    if (window.L) return resolve(window.L);
+    if (!document.getElementById("leaflet-css")) {
+      const link = document.createElement("link");
+      link.id = "leaflet-css"; link.rel = "stylesheet";
+      link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+      document.head.appendChild(link);
+    }
+    let s = document.getElementById("leaflet-js");
+    if (s) { s.addEventListener("load", () => resolve(window.L)); if (window.L) resolve(window.L); return; }
+    s = document.createElement("script");
+    s.id = "leaflet-js"; s.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+    s.onload = () => resolve(window.L);
+    document.body.appendChild(s);
+  });
+}
+function TerritoryMap({ points }) {
+  const elRef = useRef(null);
+  const mapRef = useRef(null);
+  const layerRef = useRef(null);
+  useEffect(() => {
+    let dead = false;
+    loadLeaflet().then((L) => {
+      if (dead || !L || !elRef.current) return;
+      if (!mapRef.current) {
+        mapRef.current = L.map(elRef.current, { scrollWheelZoom: false, attributionControl: false });
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 18 }).addTo(mapRef.current);
+        layerRef.current = L.layerGroup().addTo(mapRef.current);
+      }
+      const map = mapRef.current;
+      layerRef.current.clearLayers();
+      const pts = (points || []).filter((p) => typeof p.lat === "number" && typeof p.lng === "number");
+      if (pts.length) {
+        pts.forEach((p) => L.circleMarker([p.lat, p.lng], { radius: 7, color: "#1b5297", weight: 1, fillColor: "#1b5297", fillOpacity: 0.5 }).bindTooltip(p.outcode, { permanent: false }).addTo(layerRef.current));
+        map.fitBounds(L.latLngBounds(pts.map((p) => [p.lat, p.lng])).pad(0.25));
+      } else {
+        map.setView([54, -2.5], 5);
+      }
+      setTimeout(() => map.invalidateSize(), 80);
+    });
+    return () => { dead = true; };
+  }, [points]);
+  useEffect(() => () => { if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } }, []);
+  return <div ref={elRef} style={{ height: 220 }} className="w-full overflow-hidden rounded-md border border-slate-200" />;
+}
+
 /* ------------------------------- App ---------------------------------- */
 export default function App({ currentUser }) {
   const userName = currentUser || "You";
@@ -257,6 +309,8 @@ export default function App({ currentUser }) {
   const [bookingId, setBookingId] = useState(null);
   const [autoOn, setAutoOn] = useState(true);
   const [lastRun, setLastRun] = useState(null);
+  const [pcCoords, setPcCoords] = useState({});
+  const pcFetching = useRef(new Set());
   const [accountId, setAccountId] = useState(null);
   const [accSearch, setAccSearch] = useState("");
   const [woSearch, setWoSearch] = useState("");
@@ -264,12 +318,20 @@ export default function App({ currentUser }) {
   const [commentDraft, setCommentDraft] = useState("");
   const [woRecordId, setWoRecordId] = useState(null);
   const [woTab, setWoTab] = useState("general");
+  const [engRecordId, setEngRecordId] = useState(null);
+  const [settingsView, setSettingsView] = useState(null);
+  const [terrQuery, setTerrQuery] = useState({});
+  const [terrBusy, setTerrBusy] = useState({});
+  const [terrMsg, setTerrMsg] = useState({});
+  const [terrArea, setTerrArea] = useState({});
   const [toast, setToast] = useState("");
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 3200); };
 
   const { engineers, customers, jobs, certs } = data;
+  const territories = data.territories || [];
   const STORE_KEY = "flueline-dispatch-v2";
   const syncedStore = useRef(null); // last value known to be in the DB (prevents echo loops)
+  const syncedTerr = useRef(null);
 
   // load
   useEffect(() => {
@@ -311,6 +373,38 @@ export default function App({ currentUser }) {
     const unsubBridge = window.storage.subscribe(BRIDGE_KEY, () => importFromCRM());
     return () => { unsubStore && unsubStore(); unsubBridge && unsubBridge(); };
   }, [loaded]);
+
+  // share territories so the CRM can show them too
+  useEffect(() => {
+    if (!loaded || !window.storage) return;
+    const s = JSON.stringify(territories);
+    if (s === syncedTerr.current) return;
+    syncedTerr.current = s;
+    (async () => { try { await window.storage.set(TERRITORY_KEY, s); } catch (e) {} })();
+  }, [territories, loaded]);
+
+  // geocode customer postcodes to real coordinates (postcodes.io) for travel times
+  useEffect(() => {
+    if (!loaded) return;
+    const pcs = Array.from(new Set(jobs.map((j) => customers.find((c) => c.id === j.customerId)?.postcode).filter(Boolean).map((p) => p.trim().toUpperCase())));
+    const missing = pcs.filter((p) => !(p in pcCoords) && !pcFetching.current.has(p));
+    if (!missing.length) return;
+    missing.forEach((p) => pcFetching.current.add(p));
+    (async () => {
+      try {
+        const res = await fetch("https://api.postcodes.io/postcodes", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ postcodes: missing.slice(0, 100) }),
+        }).then((r) => r.json());
+        const add = {};
+        (res.result || []).forEach((item) => {
+          const q = (item.query || "").toUpperCase();
+          add[q] = item.result ? { lat: item.result.latitude, lng: item.result.longitude } : null;
+        });
+        if (Object.keys(add).length) setPcCoords((c) => ({ ...c, ...add }));
+      } catch (e) {}
+    })();
+  }, [jobs, customers, loaded]);
 
   // keep latest data/day available to the interval callback
   const dataRef = useRef(data);
@@ -364,20 +458,153 @@ export default function App({ currentUser }) {
         e.id === engId ? { ...e, status: e.status === "Available" ? "Off shift" : "Available" } : e),
     }));
 
+  const setEngineerShift = (engId, field, value) =>
+    setData((d) => ({
+      ...d,
+      engineers: d.engineers.map((e) => {
+        if (e.id !== engId) return e;
+        const next = { ...e, [field]: value };
+        let s = parseInt((next.shiftStart || "07:00").split(":")[0], 10);
+        let en = parseInt((next.shiftEnd || "19:00").split(":")[0], 10);
+        s = Math.min(Math.max(s, 7), 19); en = Math.min(Math.max(en, 7), 19);
+        if (en <= s) en = Math.min(s + 1, 19);
+        next.shiftStart = String(s).padStart(2, "0") + ":00";
+        next.shiftEnd = String(en).padStart(2, "0") + ":00";
+        return next;
+      }),
+    }));
+
   const renewCert = (certId) =>
     setData((d) => ({
       ...d,
       certs: d.certs.map((c) => (c.id === certId ? { ...c, issued: new Date().toISOString().slice(0, 10) } : c)),
     }));
 
-  const scheduleJob = (jobId, engId, time) =>
+  const scheduleJob = (jobId, engId, slotId) => {
+    const engr = engineers.find((e) => e.id === engId);
+    const job = jobs.find((j) => j.id === jobId);
+    if (!engr || !job) return;
+    if (engr.status === "Off shift") { flash(`${engr.name} is off shift.`); return; }
+    if (!(engr.skills || []).includes(job.skill)) { flash(`${engr.name} isn't a ${job.skill} engineer.`); return; }
+    if (!shiftOverlapsSlot(engr, slotId)) { flash(`${engr.name} isn't on shift during ${slotById(slotId).short}.`); return; }
+    const terrId = jobTerritoryId(job, customers, territories);
+    if (!territoryOk(engr, terrId, territories)) {
+      const tName = territories.find((t) => t.id === terrId)?.name || "this area";
+      flash(`${engr.name} doesn't cover ${tName}.`); return;
+    }
+    const slot = slotById(slotId);
     setData((d) => ({
       ...d,
       jobs: d.jobs.map((j) =>
         j.id === jobId
-          ? { ...j, engineerId: engId, time, date: scheduleDate, status: (j.status === "Unassigned" || j.status === "Completed") ? "Assigned" : j.status }
+          ? { ...j, engineerId: engId, slot: slotId, time: slot.time, date: scheduleDate, status: (j.status === "Unassigned" || j.status === "Completed") ? "Assigned" : j.status }
           : j),
     }));
+  };
+
+  /* territories + engineer editing */
+  const addTerritory = () => setData((d) => ({ ...d, territories: [...(d.territories || []), { id: uid("TER"), name: "New territory", postcodes: [] }] }));
+  const updateTerritory = (id, patch) => setData((d) => ({ ...d, territories: (d.territories || []).map((t) => (t.id === id ? { ...t, ...patch } : t)) }));
+  const deleteTerritory = (id) => setData((d) => ({
+    ...d,
+    territories: (d.territories || []).filter((t) => t.id !== id),
+    engineers: d.engineers.map((e) => (e.territoryId === id ? { ...e, territoryId: null } : e)),
+  }));
+  const updateEngineer = (id, patch) => setData((d) => ({ ...d, engineers: d.engineers.map((e) => (e.id === id ? { ...e, ...patch } : e)) }));
+  const setJobSlot = (jobId, slotId) => setData((d) => ({ ...d, jobs: d.jobs.map((j) => (j.id === jobId ? { ...j, slot: slotId, time: slotById(slotId).time } : j)) }));
+
+  // Gather postcode districts for a town (optionally a compass direction), sweeping
+  // several points so the whole council area is captured, and keep coords for the map.
+  const lookupTerritory = async (terrId) => {
+    const raw = (terrQuery[terrId] || "").trim();
+    if (!raw) return;
+    setTerrBusy((b) => ({ ...b, [terrId]: true }));
+    setTerrMsg((m) => ({ ...m, [terrId]: "" }));
+    try {
+      const dirMap = [["north west", "NW"], ["north east", "NE"], ["south west", "SW"], ["south east", "SE"], ["nw", "NW"], ["ne", "NE"], ["sw", "SW"], ["se", "SE"], ["north", "N"], ["south", "S"], ["east", "E"], ["west", "W"], ["central", "C"]];
+      const lc = raw.toLowerCase();
+      let dir = null, base = raw;
+      for (const [word, code] of dirMap) { if (lc.startsWith(word + " ")) { dir = code; base = raw.slice(word.length).trim(); break; } }
+
+      const pr = await fetch(`https://api.postcodes.io/places?q=${encodeURIComponent(base)}&limit=10`).then((r) => r.json());
+      const places = (pr && pr.result) || [];
+      if (!places.length) { setTerrMsg((m) => ({ ...m, [terrId]: `No UK place found matching "${base}". Enter postcode areas by hand.` })); return; }
+      const exact = places.filter((p) => (p.place_name || "").toLowerCase() === base.toLowerCase());
+      const place = (exact.length ? exact : places).slice().sort((a, b) => (b.population || 0) - (a.population || 0))[0];
+      if (typeof place.latitude !== "number") { setTerrMsg((m) => ({ ...m, [terrId]: `Couldn't locate "${base}". Enter areas by hand.` })); return; }
+      const center = { lat: place.latitude, lng: place.longitude };
+      const district = place.admin_district || "";
+
+      // sweep several points across the area so we don't miss outer postcodes
+      const offs = [[0, 0], [0.09, 0], [-0.09, 0], [0, 0.14], [0, -0.14], [0.09, 0.14], [-0.09, -0.14], [0.09, -0.14], [-0.09, 0.14]];
+      const seen = {};
+      for (const [dla, dlo] of offs) {
+        try {
+          const r = await fetch(`https://api.postcodes.io/outcodes?lon=${center.lng + dlo}&lat=${center.lat + dla}&limit=99&radius=20000`).then((x) => x.json());
+          (r.result || []).forEach((o) => { if (o.outcode && typeof o.latitude === "number") seen[o.outcode] = { outcode: o.outcode, lat: o.latitude, lng: o.longitude, admin: o.admin_district || [] }; });
+        } catch (e) {}
+      }
+      const cands = Object.values(seen);
+      if (!cands.length) { setTerrMsg((m) => ({ ...m, [terrId]: `Found ${place.place_name || base} but no postcode areas nearby.` })); return; }
+      const areaOf = (oc) => (oc.match(/^[A-Z]+/) || [""])[0];
+
+      let chosen = [], desc = "";
+      if (dir) {
+        const DIR_AREAS = { N: ["N", "NW", "NE"], S: ["S", "SE", "SW"], E: ["E", "EC"], W: ["W", "WC"], NW: ["NW"], NE: ["NE"], SE: ["SE"], SW: ["SW"], C: ["EC", "WC"] };
+        const cityAreas = Array.from(new Set(cands.map((c) => areaOf(c.outcode))));
+        const compassAreas = cityAreas.filter((a) => (DIR_AREAS[dir] || []).includes(a));
+        if (compassAreas.length) {
+          chosen = cands.filter((c) => compassAreas.includes(areaOf(c.outcode)));
+          desc = `the ${compassAreas.join(", ")} area${compassAreas.length > 1 ? "s" : ""}`;
+        } else {
+          const inSector = (c) => {
+            const dlat = c.lat - center.lat, dlng = c.lng - center.lng;
+            if (dir === "N") return dlat > 0; if (dir === "S") return dlat < 0;
+            if (dir === "E") return dlng > 0; if (dir === "W") return dlng < 0;
+            if (dir === "NE") return dlat > 0 && dlng > 0; if (dir === "NW") return dlat > 0 && dlng < 0;
+            if (dir === "SE") return dlat < 0 && dlng > 0; if (dir === "SW") return dlat < 0 && dlng < 0;
+            if (dir === "C") return distKm(center, { lat: c.lat, lng: c.lng }) <= 6;
+            return true;
+          };
+          chosen = cands.filter((c) => distKm(center, { lat: c.lat, lng: c.lng }) <= 18 && inSector(c));
+          desc = `${chosen.length} district(s)`;
+        }
+      } else {
+        // plain town → every outward code in the town's council area
+        chosen = cands.filter((c) => c.admin.some((d) => d && district && d.toLowerCase() === district.toLowerCase()));
+        if (chosen.length < 2) chosen = cands.filter((c) => distKm(center, { lat: c.lat, lng: c.lng }) <= 8);
+        desc = `${chosen.length} postcode district(s)`;
+      }
+
+      const outcodes = Array.from(new Set(chosen.map((c) => c.outcode))).sort();
+      if (!outcodes.length) { setTerrMsg((m) => ({ ...m, [terrId]: `Couldn't determine postcode areas for "${raw}".` })); return; }
+      const points = chosen.map((c) => ({ outcode: c.outcode, lat: c.lat, lng: c.lng }));
+      const areas = Array.from(new Set(outcodes.map(areaOf).filter(Boolean))).sort();
+      setTerrArea((a) => ({ ...a, [terrId]: areas }));
+      const t = (data.territories || []).find((x) => x.id === terrId) || { postcodes: [], name: "", points: [] };
+      const merged = Array.from(new Set([...(t.postcodes || []), ...outcodes])).sort();
+      const mergedPts = [...(t.points || []).filter((p) => !outcodes.includes(p.outcode)), ...points];
+      const title = raw.replace(/\b\w/g, (c) => c.toUpperCase());
+      const patch = { postcodes: merged, points: mergedPts };
+      if (!t.name || t.name === "New territory") patch.name = title;
+      updateTerritory(terrId, patch);
+      setTerrMsg((m) => ({ ...m, [terrId]: `Added ${desc} for ${title}.` }));
+      setTerrQuery((qq) => ({ ...qq, [terrId]: "" }));
+    } catch (e) {
+      setTerrMsg((m) => ({ ...m, [terrId]: "Lookup failed — check the connection and try again." }));
+    } finally {
+      setTerrBusy((b) => ({ ...b, [terrId]: false }));
+    }
+  };
+  // add the entire postcode area(s) (e.g. all SK) for complete coverage
+  const addWholeArea = (terrId) => {
+    const areas = terrArea[terrId] || [];
+    if (!areas.length) return;
+    const t = (data.territories || []).find((x) => x.id === terrId) || { postcodes: [] };
+    const merged = Array.from(new Set([...(t.postcodes || []), ...areas])).sort();
+    updateTerritory(terrId, { postcodes: merged });
+    setTerrMsg((m) => ({ ...m, [terrId]: `Added the whole ${areas.join(", ")} area — every ${areas.join("/")} postcode now matches.` }));
+  };
 
   const unscheduleJob = (jobId) =>
     setData((d) => ({
@@ -465,13 +692,15 @@ export default function App({ currentUser }) {
             c = { id: uid("CUS"), name: b.account || "CRM customer", type: b.accountType?.startsWith("Land") ? "Landlord" : b.accountType?.startsWith("Comm") ? "Commercial" : "Domestic", address: b.address || "—", postcode: b.postcode || "", phone: b.phone || "", contacts: [] };
             custs.push(c);
           }
+          const sid = b.requestedSlot || (timeToMin(b.requestedTime || "09:00") < 12 * 60 + 30 ? "AM" : "PM");
           newJobs.push({
             id: uid("JOB"), wo: b.wo, customerId: c.id,
             type: b.type === "Service" ? "Service" : "Repair",
             skill: b.skill || "Boilers", priority: b.priority || "Routine",
-            date: b.requestedDate || relDate(0), time: b.requestedTime || "09:00",
+            date: b.requestedDate || relDate(0), time: slotById(sid).time, slot: sid,
             durationMin: b.durationMin || 60, engineerId: null, status: "Unassigned",
             notes: b.description || "", source: "CRM",
+            comments: b.description ? [{ author: b.createdBy || "CRM booking", text: b.description, at: b.createdAt || new Date().toISOString() }] : [],
           });
           have.add(b.wo);
         });
@@ -498,6 +727,8 @@ export default function App({ currentUser }) {
 
   // close any open work-order record when leaving the Work Orders tab
   useEffect(() => { if (tab !== "workorders") setWoRecordId(null); }, [tab]);
+  useEffect(() => { if (tab !== "engineers") setEngRecordId(null); }, [tab]);
+  useEffect(() => { if (tab !== "settings") setSettingsView(null); }, [tab]);
 
   // write scheduling status back to the bridge so the CRM reflects it
   useEffect(() => {
@@ -528,7 +759,7 @@ export default function App({ currentUser }) {
   const openModal = (type) => {
     const defaults = {
       job: { customerId: customers[0]?.id || "", type: "Repair", skill: "Boilers", priority: "Routine", date: relDate(0), time: "09:00", durationMin: 60, notes: "" },
-      engineer: { name: "", gasSafe: "", phone: "", area: "North London", status: "Available", skills: [] },
+      engineer: { name: "", gasSafe: "", phone: "", area: "North London", status: "Available", skills: [], shiftStart: "07:00", shiftEnd: "19:00" },
       customer: { name: "", type: "Domestic", address: "", postcode: "", phone: "" },
       cert: { customerId: customers[0]?.id || "", engineerId: engineers[0]?.id || "", type: CERT_TYPES[0], issued: relDate(0), appliances: 1 },
       contact: { name: "", role: "", phone: "", email: "" },
@@ -753,17 +984,15 @@ export default function App({ currentUser }) {
 
   function renderSchedule() {
     const shiftDay = (n) => setScheduleDate(new Date(Date.parse(scheduleDate) + n * DAY).toISOString().slice(0, 10));
-    const unscheduled = jobs.filter((j) => j.status === "Unassigned");
+    const unscheduled = jobs.filter((j) => j.status === "Unassigned" && j.date === scheduleDate);
 
     const onDropRow = (engId) => (ev) => {
       ev.preventDefault();
       const id = ev.dataTransfer.getData("text/plain");
       if (!id) return;
-      const rect = ev.currentTarget.getBoundingClientRect();
-      const x = ev.clientX - rect.left;
-      let min = snap15((x / PX_HR) * 60 + WIN_START * 60);
-      min = Math.max(WIN_START * 60, Math.min(WIN_END * 60 - 15, min));
-      scheduleJob(id, engId, minToTime(min));
+      const job = jobs.find((j) => j.id === id);
+      if (!job) return;
+      scheduleJob(id, engId, slotOf(job)); // keep the booked slot; drag only assigns the engineer
     };
 
     return (
@@ -772,7 +1001,6 @@ export default function App({ currentUser }) {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-1">
             <button onClick={() => shiftDay(-1)} className="rounded-md border border-slate-200 bg-white p-2 text-slate-500 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500"><ChevronLeft size={16} /></button>
-            <button onClick={() => setScheduleDate(relDate(0))} className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500">Today</button>
             <button onClick={() => shiftDay(1)} className="rounded-md border border-slate-200 bg-white p-2 text-slate-500 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500"><ChevronRight size={16} /></button>
             <span className="ml-2 flex items-center gap-2 text-sm font-semibold text-slate-700">
               <CalendarRange size={16} className="text-slate-400" />
@@ -785,36 +1013,6 @@ export default function App({ currentUser }) {
                 <span className={"inline-block h-3 w-3 rounded-sm border " + blockClass(s)} />{s}
               </span>
             ))}
-          </div>
-        </div>
-
-        {/* auto-scheduler */}
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setAutoOn((v) => !v)}
-              role="switch"
-              aria-checked={autoOn}
-              aria-label="Toggle auto-scheduler"
-              className={"relative h-6 w-11 shrink-0 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 " + (autoOn ? "bg-blue-600" : "bg-slate-300")}
-            >
-              <span className={"absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all " + (autoOn ? "left-5" : "left-0.5")} />
-            </button>
-            <div>
-              <div className="text-sm font-medium text-slate-800">Auto-scheduler {autoOn && <span className="ml-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">running</span>}</div>
-              <div className="text-xs text-slate-500">Books unscheduled work every 5 minutes around travel time and existing jobs.</div>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            {lastRun && (
-              <span className="text-xs text-slate-500">
-                Last run {lastRun.at.toLocaleTimeString("en-GB")} · <span className="font-medium text-emerald-600">{lastRun.assigned} booked</span>
-                {lastRun.unplaceable > 0 && <span className="font-medium text-rose-500"> · {lastRun.unplaceable} couldn't be placed</span>}
-              </span>
-            )}
-            <button onClick={runAuto} className="flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500">
-              <RotateCw size={15} /> Run now
-            </button>
           </div>
         </div>
 
@@ -837,6 +1035,37 @@ export default function App({ currentUser }) {
               {engineers.map((r) => {
                 const bookings = jobs.filter((j) => j.engineerId === r.id && j.date === scheduleDate && j.status !== "Cancelled");
                 const off = r.status === "Off shift";
+                const sh = shiftHours(r);
+                const shiftLeft = (sh.start - WIN_START) * PX_HR;
+                const shiftWidth = (sh.end - sh.start) * PX_HR;
+                // lay jobs out from the slot's start, each box as wide as its booked duration
+                // place jobs strictly within the engineer's shift, inside their slot window:
+                // AM jobs sit in [max(shiftStart,08:00) .. min(shiftEnd,12:00)], PM in
+                // [max(shiftStart,13:00) .. min(shiftEnd,18:00)]; nothing ever leaves the shift.
+                const coordOf = (j) => pcCoords[(cust(j.customerId)?.postcode || "").trim().toUpperCase()] || null;
+                const S = sh.start * 60, E = sh.end * 60;
+                const blocks = [];
+                SLOTS.forEach((slot) => {
+                  const slotJobs = bookings.filter((j) => slotOf(j) === slot.id);
+                  if (!slotJobs.length) return;
+                  let w0 = Math.max(S, slot.start * 60);
+                  let w1 = Math.min(E, slot.end * 60);
+                  if (w1 <= w0) { w0 = S; w1 = E; } // shift doesn't reach this slot → use whole shift
+                  let cursor = w0, prevCoord = null;
+                  slotJobs.forEach((j) => {
+                    const dur = jobDuration(j);
+                    const travel = prevCoord ? Math.min(60, travelMin(prevCoord, coordOf(j))) : 0;
+                    let start = prevCoord ? cursor + travel : w0;
+                    const maxStart = Math.max(w0, w1 - dur); // never run past the shift/slot end
+                    if (start > maxStart) start = maxStart;
+                    if (start < w0) start = w0;
+                    const end = Math.min(start + dur, w1);
+                    const left = ((start - WIN_START * 60) / 60) * PX_HR;
+                    const width = ((end - start) / 60) * PX_HR - 2;
+                    blocks.push({ j, left, width, dur, startMin: start, travel, prevEnd: prevCoord ? cursor : null });
+                    cursor = end; prevCoord = coordOf(j);
+                  });
+                });
                 return (
                   <div key={r.id} className="flex border-b border-slate-100 last:border-0">
                     <div style={{ width: RESOURCE_W }} className={"shrink-0 px-3 py-2 " + (off ? "opacity-50" : "")}>
@@ -844,7 +1073,7 @@ export default function App({ currentUser }) {
                         <CircleDot size={11} className={r.status === "Available" ? "text-emerald-500" : r.status === "On job" ? "text-amber-500" : "text-slate-300"} />
                         {r.name}
                       </div>
-                      <div className="truncate text-xs text-slate-400">{r.area} · {bookings.length} job{bookings.length === 1 ? "" : "s"}</div>
+                      <div className="truncate text-xs text-slate-400">{off ? "Off shift" : `${r.shiftStart || "07:00"}–${r.shiftEnd || "19:00"}`} · {bookings.length} job{bookings.length === 1 ? "" : "s"}</div>
                     </div>
                     <div
                       className={"relative border-l border-slate-200 " + (off ? "bg-slate-50" : "")}
@@ -852,28 +1081,33 @@ export default function App({ currentUser }) {
                       onDragOver={(ev) => ev.preventDefault()}
                       onDrop={onDropRow(r.id)}
                     >
+                      {/* shift availability box */}
+                      {!off && shiftWidth > 0 && (
+                        <div className="absolute top-0 h-full border-x border-blue-200 bg-blue-50/60" style={{ left: shiftLeft, width: shiftWidth }} title={`Shift ${r.shiftStart || "07:00"}–${r.shiftEnd || "19:00"}`} />
+                      )}
+                      {/* hour gridlines */}
                       {HOURS.slice(1).map((h) => (
                         <div key={h} className="absolute top-0 h-full border-l border-slate-100" style={{ left: (h - WIN_START) * PX_HR }} />
                       ))}
-                      {bookings.map((j) => {
-                        const start = timeToMin(j.time);
-                        const dur = jobDuration(j);
-                        const left = Math.max(0, ((start - WIN_START * 60) / 60) * PX_HR);
-                        const width = Math.max(34, (dur / 60) * PX_HR - 2);
-                        return (
+                      {blocks.map(({ j, left, width, dur, startMin, travel, prevEnd }, i) => (
+                        <div key={j.id}>
+                          {i > 0 && travel > 0 && prevEnd != null && (
+                            <div className="absolute z-10 flex items-center gap-0.5 rounded bg-white/90 px-1 text-[10px] font-medium text-slate-500 shadow-sm" style={{ left: ((prevEnd - WIN_START * 60) / 60) * PX_HR + 1, top: 2 }}>
+                              <Car size={9} /> {travel}
+                            </div>
+                          )}
                           <button
-                            key={j.id}
                             draggable
                             onDragStart={(ev) => ev.dataTransfer.setData("text/plain", j.id)}
                             onClick={() => setBookingId(j.id)}
                             className={"absolute top-1 overflow-hidden rounded-md border-l-4 px-2 py-1 text-left shadow-sm hover:shadow focus:outline-none focus:ring-2 focus:ring-blue-500 " + blockClass(j.status)}
-                            style={{ left, width, height: ROW_H - 8 }}
+                            style={{ left, width: Math.max(34, width), height: ROW_H - 8 }}
                           >
                             <div className="truncate text-xs font-semibold">{custName(j.customerId)}</div>
-                            <div className="truncate text-xs opacity-80">{j.time} · {j.type} ({dur}m)</div>
+                            <div className="truncate text-xs opacity-80">{minToTime(startMin)} · {dur}m</div>
                           </button>
-                        );
-                      })}
+                        </div>
+                      ))}
                     </div>
                   </div>
                 );
@@ -924,7 +1158,7 @@ export default function App({ currentUser }) {
                         <td className="px-3 py-2.5 text-slate-600">{j.skill}</td>
                         <td className="px-3 py-2.5 text-slate-600">{jobDuration(j)} min</td>
                         <td className="px-3 py-2.5"><Badge className={priorityClass(j.priority)}>{j.priority}</Badge></td>
-                        <td className="px-3 py-2.5 text-slate-600">{fmtDate(j.date)} {j.time}</td>
+                        <td className="px-3 py-2.5 text-slate-600">{fmtDate(j.date)} · {slotById(slotOf(j)).short}</td>
                       </tr>
                     );
                   })}
@@ -956,9 +1190,20 @@ export default function App({ currentUser }) {
         <div className="space-y-1 text-sm text-slate-600">
           <div className="flex items-center gap-2"><MapPin size={14} className="text-slate-400" />{cust(j.customerId)?.address}, {cust(j.customerId)?.postcode}</div>
           <div className="flex items-center gap-2"><Wrench size={14} className="text-slate-400" />{eng(j.engineerId)?.name || "Unassigned"} · {j.type} · {j.skill}</div>
-          <div className="flex items-center gap-2"><Clock size={14} className="text-slate-400" />{j.time} on {fmtDate(j.date)}</div>
+          <div className="flex items-center gap-2"><Clock size={14} className="text-slate-400" />{slotById(slotOf(j)).short} on {fmtDate(j.date)}</div>
         </div>
         {j.notes && <p className="rounded-md bg-slate-50 p-2 text-xs text-slate-500">{j.notes}</p>}
+
+        <div className="flex items-center justify-between border-t border-slate-100 pt-3">
+          <span className="text-xs font-medium text-slate-500">Time slot</span>
+          <div className="flex items-center gap-1">
+            {SLOTS.map((s) => (
+              <button key={s.id} onClick={() => setJobSlot(j.id, s.id)} className={"rounded-md px-2.5 py-1 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-blue-500 " + (slotOf(j) === s.id ? "bg-blue-600 text-white" : "border border-slate-300 text-slate-600 hover:bg-slate-50")}>
+                {s.short}
+              </button>
+            ))}
+          </div>
+        </div>
 
         <div className="flex items-center justify-between border-t border-slate-100 pt-3">
           <span className="text-xs font-medium text-slate-500">Duration</span>
@@ -1052,6 +1297,7 @@ export default function App({ currentUser }) {
                 <th className="px-3 py-2 font-medium">Work Order Number</th>
                 <th className="px-3 py-2 font-medium">Customer Account</th>
                 <th className="px-3 py-2 font-medium">Postal Code</th>
+                <th className="px-3 py-2 font-medium">Territory</th>
                 <th className="px-3 py-2 font-medium">System Status</th>
                 <th className="px-3 py-2 font-medium">Work Order Type</th>
                 <th className="px-3 py-2 font-medium">Trade</th>
@@ -1068,12 +1314,13 @@ export default function App({ currentUser }) {
                   <td className="px-3 py-2.5"><button onClick={() => { setWoRecordId(j.id); setWoTab("general"); setCommentDraft(""); }} className="font-mono text-blue-700 hover:underline focus:outline-none">{j.wo || j.id}</button></td>
                   <td className="px-3 py-2.5 text-slate-700">{custName(j.customerId)}</td>
                   <td className="px-3 py-2.5 text-slate-600">{cust(j.customerId)?.postcode || "—"}</td>
+                  <td className="px-3 py-2.5 text-slate-600">{territoryForPostcode(cust(j.customerId)?.postcode, territories)?.name || <span className="text-slate-400">—</span>}</td>
                   <td className="px-3 py-2.5"><Badge className={sysStatusClass(j.status)}>{sysStatus(j.status)}</Badge></td>
                   <td className="px-3 py-2.5 text-slate-600">Gas {j.type}</td>
                   <td className="px-3 py-2.5 text-slate-600">{j.skill}</td>
                   <td className="px-3 py-2.5"><Badge className={priorityClass(j.priority)}>{j.priority}</Badge></td>
                   <td className="px-3 py-2.5 text-slate-600">{j.engineerId ? eng(j.engineerId)?.name : <span className="text-slate-400">—</span>}</td>
-                  <td className="px-3 py-2.5 text-slate-600">{fmtDate(j.date)} {j.time}</td>
+                  <td className="px-3 py-2.5 text-slate-600">{fmtDate(j.date)} · {slotById(slotOf(j)).short}</td>
                   <td className="px-3 py-2.5 text-right">
                     {!["Completed", "Cancelled"].includes(j.status) && (
                       <button onClick={() => { cancelJob(j.id); flash("Work order cancelled."); }} className="text-xs font-medium text-rose-600 hover:underline focus:outline-none">Cancel</button>
@@ -1081,7 +1328,7 @@ export default function App({ currentUser }) {
                   </td>
                 </tr>
               ))}
-              {rows.length === 0 && <tr><td colSpan={11} className="px-4 py-6 text-center text-slate-400">No work orders.</td></tr>}
+              {rows.length === 0 && <tr><td colSpan={12} className="px-4 py-6 text-center text-slate-400">No work orders.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1130,7 +1377,7 @@ export default function App({ currentUser }) {
             <div className="flex flex-wrap gap-5 text-left">
               <div><div className="text-xs text-slate-400">System Status</div><Badge className={sysStatusClass(j.status)}>{sysStatus(j.status)}</Badge></div>
               <div><div className="text-xs text-slate-400">Engineer</div><div className="text-sm font-medium text-slate-700">{engr?.name || "—"}</div></div>
-              <div><div className="text-xs text-slate-400">Promised</div><div className="text-sm font-medium text-slate-700">{fmtDate(j.date)} {j.time}</div></div>
+              <div><div className="text-xs text-slate-400">Promised</div><div className="text-sm font-medium text-slate-700">{fmtDate(j.date)} · {slotById(slotOf(j)).short}</div></div>
             </div>
           </div>
           {/* stage path */}
@@ -1172,13 +1419,14 @@ export default function App({ currentUser }) {
                 {F("Name", c?.name)}
                 {F("Address", c?.address)}
                 {F("Postcode", c?.postcode)}
+                {F("Scheduling territory", territoryForPostcode(c?.postcode, territories)?.name)}
                 {F("Phone", c?.phone)}
                 {F("Type", c?.type)}
               </div>
               <div>
                 <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Appointment slot</h4>
                 {F("Date", fmtDate(j.date))}
-                {F("Time", j.time)}
+                {F("Time slot", slotById(slotOf(j)).short)}
                 {F("Duration", dur + " min")}
                 {F("Description", j.notes)}
               </div>
@@ -1198,7 +1446,7 @@ export default function App({ currentUser }) {
                 {F("Engineer", engr?.name)}
                 {F("Territory", engr?.area)}
                 {F("Scheduled date", fmtDate(j.date))}
-                {F("Scheduled time", j.time)}
+                {F("Scheduled slot", slotById(slotOf(j)).short)}
               </div>
             </div>
           )}
@@ -1241,6 +1489,226 @@ export default function App({ currentUser }) {
     );
   }
 
+  function renderEngineerRecord() {
+    const e = engineers.find((x) => x.id === engRecordId);
+    if (!e) return <button onClick={() => setEngRecordId(null)} className="text-sm font-medium text-blue-700">← Back to Engineers</button>;
+    const hourOpts = Array.from({ length: 13 }, (_, i) => 7 + i).map((h) => String(h).padStart(2, "0") + ":00");
+    const activeJobs = jobs.filter((j) => j.engineerId === e.id && j.status !== "Completed").length;
+    const toggleSkill = (s) => updateEngineer(e.id, { skills: (e.skills || []).includes(s) ? e.skills.filter((x) => x !== s) : [...(e.skills || []), s] });
+    const F = (label, node) => (
+      <label className="block border-b border-slate-100 py-2">
+        <div className="mb-1 text-xs text-slate-400">{label}</div>
+        {node}
+      </label>
+    );
+    const inp = "w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500";
+    return (
+      <div className="space-y-3">
+        <div className="flex flex-wrap items-center gap-2 rounded-t-lg border border-slate-200 bg-white px-3 py-2 shadow-sm">
+          <button onClick={() => setEngRecordId(null)} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><ArrowLeft size={15} /> Engineers</button>
+          <button onClick={() => { toggleAvailability(e.id); }} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><CircleDot size={15} /> {e.status === "Available" ? "Set off shift" : "Set available"}</button>
+          <span className="ml-auto text-xs text-slate-400">Changes save automatically.</span>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <Wrench size={22} className="text-blue-600" />
+              <div>
+                <div className="text-lg font-semibold text-slate-800">{e.name || "New engineer"}</div>
+                <div className="text-xs text-slate-500">Bookable resource · Gas</div>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-5">
+              <div><div className="text-xs text-slate-400">Status</div><Badge className={engStatusClass(e.status)}><CircleDot size={11} />{e.status}</Badge></div>
+              <div><div className="text-xs text-slate-400">Territory</div><div className="text-sm font-medium text-slate-700">{territories.find((t) => t.id === e.territoryId)?.name || "Unassigned"}</div></div>
+              <div><div className="text-xs text-slate-400">Active jobs</div><div className="text-sm font-medium text-slate-700">{activeJobs}</div></div>
+            </div>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Resource details</h4>
+            {F("Name", <input className={inp} value={e.name || ""} onChange={(ev) => updateEngineer(e.id, { name: ev.target.value })} />)}
+            {F("Gas Safe No.", <input className={inp} value={e.gasSafe || ""} onChange={(ev) => updateEngineer(e.id, { gasSafe: ev.target.value })} />)}
+            {F("Mobile phone", <input className={inp} value={e.phone || ""} onChange={(ev) => updateEngineer(e.id, { phone: ev.target.value })} />)}
+            {F("Status", (
+              <select className={inp} value={e.status} onChange={(ev) => updateEngineer(e.id, { status: ev.target.value })}>
+                {ENG_STATUS.map((s) => <option key={s}>{s}</option>)}
+              </select>
+            ))}
+          </div>
+
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Territory &amp; shift</h4>
+            {F("Scheduling territory", (
+              <select className={inp} value={e.territoryId || ""} onChange={(ev) => updateEngineer(e.id, { territoryId: ev.target.value || null })}>
+                <option value="">Unassigned</option>
+                {territories.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            ))}
+            <div className="grid grid-cols-2 gap-3">
+              {F("Shift start", (
+                <select className={inp} value={e.shiftStart || "07:00"} onChange={(ev) => setEngineerShift(e.id, "shiftStart", ev.target.value)}>
+                  {hourOpts.map((v) => <option key={v} value={v}>{v}</option>)}
+                </select>
+              ))}
+              {F("Shift end", (
+                <select className={inp} value={e.shiftEnd || "19:00"} onChange={(ev) => setEngineerShift(e.id, "shiftEnd", ev.target.value)}>
+                  {hourOpts.map((v) => <option key={v} value={v}>{v}</option>)}
+                </select>
+              ))}
+            </div>
+            {territories.length === 0 && <p className="mt-1 text-xs text-slate-400">No territories yet — add them in Settings.</p>}
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+          <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Trades</h4>
+          <div className="flex flex-wrap gap-2">
+            {SKILLS.map((s) => {
+              const on = (e.skills || []).includes(s);
+              return (
+                <button key={s} onClick={() => toggleSkill(s)} className={"rounded-full border px-3 py-1 text-xs font-medium focus:outline-none focus:ring-2 focus:ring-blue-500 " + (on ? "border-blue-300 bg-blue-50 text-blue-700" : "border-slate-200 text-slate-500 hover:bg-slate-50")}>
+                  {on ? "✓ " : ""}{s}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  function renderSettings() {
+    const parsePostcodes = (str) => str.split(/[,\s]+/).map((x) => x.trim().toUpperCase()).filter(Boolean);
+    const backBar = (title) => (
+      <div className="flex flex-wrap items-center gap-2 rounded-t-lg border border-slate-200 bg-white px-3 py-2 shadow-sm">
+        <button onClick={() => setSettingsView(null)} className="flex items-center gap-1 rounded px-2.5 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-100"><ArrowLeft size={15} /> Settings</button>
+        <span className="text-sm font-semibold text-slate-700">{title}</span>
+      </div>
+    );
+
+    // ---- Auto-scheduler ----
+    if (settingsView === "scheduler") {
+      return (
+        <div className="space-y-3">
+          {backBar("Auto-scheduler")}
+          <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="flex items-center gap-3">
+              <button onClick={() => setAutoOn((v) => !v)} role="switch" aria-checked={autoOn} aria-label="Toggle auto-scheduler" className={"relative h-6 w-11 shrink-0 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 " + (autoOn ? "bg-blue-600" : "bg-slate-300")}>
+                <span className={"absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition-all " + (autoOn ? "left-5" : "left-0.5")} />
+              </button>
+              <div>
+                <div className="text-sm font-medium text-slate-800">Auto-scheduler {autoOn ? <span className="ml-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">on</span> : <span className="ml-1 rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">off</span>}</div>
+                <div className="text-xs text-slate-500">When on, unscheduled work is booked into engineers' morning/afternoon slots automatically — respecting each engineer's shift, trade and territory.</div>
+              </div>
+            </div>
+            <div className="mt-4 flex flex-wrap items-center gap-3 border-t border-slate-100 pt-4">
+              <button onClick={runAuto} className="flex items-center gap-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500"><RotateCw size={15} /> Run now</button>
+              {lastRun && (
+                <span className="text-xs text-slate-500">Last run {lastRun.at.toLocaleTimeString("en-GB")} · <span className="font-medium text-emerald-600">{lastRun.assigned} booked</span>{lastRun.unplaceable > 0 && <span className="font-medium text-rose-500"> · {lastRun.unplaceable} couldn't be placed</span>}</span>
+              )}
+            </div>
+            <p className="mt-3 text-xs text-slate-400">While on, it also re-runs automatically every few minutes. Turning it off here stops new automatic bookings; existing bookings stay put.</p>
+          </div>
+        </div>
+      );
+    }
+
+    // ---- Scheduling territories ----
+    if (settingsView === "territories") {
+      return (
+        <div className="space-y-3">
+          {backBar("Scheduling territories")}
+          <div className="rounded-lg border border-slate-200 bg-white shadow-sm">
+            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Map size={18} className="text-blue-600" />
+                <h3 className="text-lg font-semibold text-slate-800">Scheduling territories</h3>
+              </div>
+              <button onClick={addTerritory} className="flex items-center gap-1 rounded-md bg-blue-600 px-3 py-2 text-sm font-medium text-white hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"><Plus size={15} /> Add territory</button>
+            </div>
+            <div className="p-4">
+              <p className="mb-3 text-xs text-slate-500">Define each territory's postcode areas (outward codes), e.g. <span className="font-mono">SK1, SK2, SK3</span> or just <span className="font-mono">SK</span> for the whole area. Or type a town below — and you can add a direction like <span className="font-medium">south london</span> or <span className="font-medium">north manchester</span> to capture just that part. Jobs are matched to engineers by territory based on the customer's postcode.</p>
+              {territories.length === 0 && <p className="py-6 text-center text-sm text-slate-400">No territories yet. Add one to start matching jobs to engineers by area.</p>}
+              <div className="space-y-3">
+                {territories.map((t) => (
+                  <div key={t.id} className="rounded-md border border-slate-200 p-3">
+                    <div className="grid grid-cols-1 gap-3 md:grid-cols-[1fr,2fr,auto] md:items-end">
+                      <label className="block">
+                        <div className="mb-1 text-xs text-slate-400">Territory name</div>
+                        <input className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" value={t.name} onChange={(e) => updateTerritory(t.id, { name: e.target.value })} />
+                      </label>
+                      <label className="block">
+                        <div className="mb-1 text-xs text-slate-400">Postcode areas</div>
+                        <input className="w-full rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500" value={(t.postcodes || []).join(", ")} onChange={(e) => updateTerritory(t.id, { postcodes: parsePostcodes(e.target.value) })} placeholder="SK1, SK2, SK3" />
+                      </label>
+                      <button onClick={() => deleteTerritory(t.id)} className="flex items-center justify-center gap-1 rounded-md border border-rose-200 px-3 py-2 text-sm font-medium text-rose-600 hover:bg-rose-50 focus:outline-none focus:ring-2 focus:ring-rose-400"><Trash2 size={14} /> Delete</button>
+                    </div>
+                    <div className="mt-3 rounded-md bg-slate-50 p-2.5">
+                      <div className="mb-1 text-xs font-medium text-slate-500">Add areas from a town or city</div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <input
+                          value={terrQuery[t.id] || ""}
+                          onChange={(e) => setTerrQuery((q) => ({ ...q, [t.id]: e.target.value }))}
+                          onKeyDown={(e) => { if (e.key === "Enter") lookupTerritory(t.id); }}
+                          placeholder="e.g. Stockport, south london, north manchester"
+                          className="flex-1 rounded-md border border-slate-300 px-2.5 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                        />
+                        <button onClick={() => lookupTerritory(t.id)} disabled={terrBusy[t.id] || !(terrQuery[t.id] || "").trim()} className="flex items-center gap-1 rounded-md bg-slate-800 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50">
+                          <Search size={14} /> {terrBusy[t.id] ? "Looking up…" : "Look up areas"}
+                        </button>
+                      </div>
+                      {terrMsg[t.id] && <p className="mt-1.5 text-xs text-slate-500">{terrMsg[t.id]}</p>}
+                      {(terrArea[t.id] || []).length > 0 && (
+                        <button onClick={() => addWholeArea(t.id)} className="mt-2 rounded-md border border-slate-300 bg-white px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-blue-500">
+                          + Add the whole {(terrArea[t.id] || []).join(", ")} area (every postcode)
+                        </button>
+                      )}
+                    </div>
+                    <div className="mt-2 text-xs text-slate-400">{engineers.filter((e) => e.territoryId === t.id).length} engineer(s) · covers {(t.postcodes || []).length} area(s)</div>
+                    {(t.points || []).length > 0 && (
+                      <div className="mt-2">
+                        <div className="mb-1 text-xs font-medium text-slate-500">Coverage map</div>
+                        <TerritoryMap points={t.points} />
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ---- Settings menu ----
+    const items = [
+      { id: "territories", icon: Map, title: "Scheduling territories", desc: "Define postcode areas and match jobs to engineers by area.", meta: `${territories.length} territory${territories.length === 1 ? "" : "ies"}` },
+      { id: "scheduler", icon: RotateCw, title: "Auto-scheduler", desc: "Automatically book unscheduled work into engineers' slots.", meta: autoOn ? "On" : "Off" },
+    ];
+    return (
+      <div className="rounded-lg border border-slate-200 bg-white shadow-sm">
+        <div className="border-b border-slate-200 px-4 py-3"><h3 className="text-lg font-semibold text-slate-800">Settings</h3></div>
+        <div className="divide-y divide-slate-100">
+          {items.map((it) => (
+            <button key={it.id} onClick={() => setSettingsView(it.id)} className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-slate-50 focus:outline-none">
+              <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-blue-50 text-blue-600"><it.icon size={18} /></span>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-slate-800">{it.title}</div>
+                <div className="truncate text-xs text-slate-500">{it.desc}</div>
+              </div>
+              <span className="shrink-0 text-xs text-slate-400">{it.meta}</span>
+              <ChevronRight size={16} className="shrink-0 text-slate-300" />
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   function renderEngineers() {
     const term = engSearch.trim().toLowerCase();
     const rows = engineers.filter((e) =>
@@ -1276,6 +1744,7 @@ export default function App({ currentUser }) {
                 <th className="px-3 py-2 font-medium">Gas Safe No.</th>
                 <th className="px-3 py-2 font-medium">Mobile Phone</th>
                 <th className="px-3 py-2 font-medium">Trades</th>
+                <th className="px-3 py-2 font-medium">Shift</th>
                 <th className="px-3 py-2 font-medium">Primary Business Area</th>
                 <th className="px-3 py-2 font-medium">Status</th>
                 <th className="px-3 py-2 font-medium">Active Jobs</th>
@@ -1288,13 +1757,24 @@ export default function App({ currentUser }) {
                 return (
                   <tr key={e.id} className="hover:bg-blue-50">
                     <td className="px-3 py-2.5 text-slate-300"><Circle size={13} /></td>
-                    <td className="px-3 py-2.5 font-medium text-slate-800">{e.name}</td>
-                    <td className="px-3 py-2.5 text-slate-600">{e.area}</td>
+                    <td className="px-3 py-2.5"><button onClick={() => setEngRecordId(e.id)} className="font-medium text-blue-700 hover:underline focus:outline-none">{e.name}</button></td>
+                    <td className="px-3 py-2.5 text-slate-600">{territories.find((t) => t.id === e.territoryId)?.name || <span className="text-slate-400">Unassigned</span>}</td>
                     <td className="px-3 py-2.5 font-mono text-xs text-slate-500">{e.gasSafe}</td>
                     <td className="px-3 py-2.5 text-slate-600">{e.phone}</td>
                     <td className="px-3 py-2.5">
                       <div className="flex flex-wrap gap-1">
                         {e.skills.map((s) => <span key={s} className="rounded bg-blue-50 px-1.5 py-0.5 text-xs text-blue-700">{s}</span>)}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2.5">
+                      <div className="flex items-center gap-1">
+                        <select value={e.shiftStart || "07:00"} onChange={(ev) => setEngineerShift(e.id, "shiftStart", ev.target.value)} className="rounded border border-slate-300 px-1 py-0.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
+                          {Array.from({ length: 13 }, (_, i) => 7 + i).map((h) => { const v = String(h).padStart(2, "0") + ":00"; return <option key={h} value={v}>{v}</option>; })}
+                        </select>
+                        <span className="text-xs text-slate-400">–</span>
+                        <select value={e.shiftEnd || "19:00"} onChange={(ev) => setEngineerShift(e.id, "shiftEnd", ev.target.value)} className="rounded border border-slate-300 px-1 py-0.5 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500">
+                          {Array.from({ length: 13 }, (_, i) => 7 + i).map((h) => { const v = String(h).padStart(2, "0") + ":00"; return <option key={h} value={v}>{v}</option>; })}
+                        </select>
                       </div>
                     </td>
                     <td className="px-3 py-2.5 text-slate-600">Gas</td>
@@ -1308,7 +1788,7 @@ export default function App({ currentUser }) {
                   </tr>
                 );
               })}
-              {rows.length === 0 && <tr><td colSpan={10} className="px-4 py-6 text-center text-slate-400">No engineers yet. Use New to add one.</td></tr>}
+              {rows.length === 0 && <tr><td colSpan={11} className="px-4 py-6 text-center text-slate-400">No engineers yet. Use New to add one.</td></tr>}
             </tbody>
           </table>
         </div>
@@ -1668,8 +2148,9 @@ export default function App({ currentUser }) {
     { id: "schedule", label: "Schedule board", icon: CalendarRange },
     { id: "workorders", label: "Work Orders", icon: Briefcase },
     { id: "engineers", label: "Engineers", icon: Wrench },
+    { id: "settings", label: "Settings", icon: Settings },
   ];
-  const titles = { dashboard: "Dashboard", dispatch: "Dispatch board", workorders: "Work Orders", schedule: "Schedule board", engineers: "Engineers", accounts: "Accounts", certs: "Gas safety certificates" };
+  const titles = { dashboard: "Dashboard", dispatch: "Dispatch board", workorders: "Work Orders", schedule: "Schedule board", engineers: "Engineers", accounts: "Accounts", certs: "Gas safety certificates", settings: "Settings" };
 
   return (
     <div className="flex min-h-screen bg-slate-100 font-sans text-slate-800">
@@ -1719,9 +2200,10 @@ export default function App({ currentUser }) {
           {tab === "dispatch" && renderDispatch()}
           {tab === "workorders" && (woRecordId ? renderWorkOrderRecord() : renderWorkOrders())}
           {tab === "schedule" && renderSchedule()}
-          {tab === "engineers" && renderEngineers()}
+          {tab === "engineers" && (engRecordId ? renderEngineerRecord() : renderEngineers())}
           {tab === "accounts" && renderAccounts()}
           {tab === "certs" && renderCerts()}
+          {tab === "settings" && renderSettings()}
         </main>
       </div>
 

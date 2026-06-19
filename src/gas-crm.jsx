@@ -14,6 +14,17 @@ const WO_TYPES = ["Repair", "Service", "Installation"];
 const WO_SKILLS = ["Boilers", "Central heating", "Gas fires", "Cookers & hobs", "Commercial", "Power flushing", "Landlord certs"];
 const WO_STATUS = ["New", "Unscheduled", "Scheduled", "In progress", "Completed", "Cancelled"];
 const BRIDGE_KEY = "gas-bridge-workorders-v2";
+const TERRITORY_KEY = "gas-territories-v1";
+const outwardArea = (pc) => (pc || "").trim().toUpperCase().split(/\s+/)[0];
+const outwardPrefix = (a) => (a.match(/^[A-Z]+/) || [""])[0];
+const territoryForPostcode = (pc, territories) => {
+  const area = outwardArea(pc);
+  if (!area) return null;
+  const pref = outwardPrefix(area);
+  return (territories || []).find((t) =>
+    (t.postcodes || []).some((p) => { const P = (p || "").trim().toUpperCase(); return P && (area === P || pref === P || area.startsWith(P)); })
+  ) || null;
+};
 const PRIORITIES = ["Emergency", "High", "Routine"];
 const ACTIVITY_TYPES = ["Call", "Email", "Task", "Note"];
 
@@ -94,6 +105,7 @@ export default function App({ currentUser }) {
   const userName = currentUser || "You";
   const [data, setData] = useState(seed());
   const [loaded, setLoaded] = useState(false);
+  const [territories, setTerritories] = useState([]);
   const [route, setRoute] = useState({ object: "home", id: null });
   const [recordTab, setRecordTab] = useState("related");
   const [q, setQ] = useState("");
@@ -147,8 +159,9 @@ export default function App({ currentUser }) {
             wo: w.id, account: a?.name || "—", postcode: a?.postcode || "", accountType: a?.type || "Domestic",
             address: a?.address || "", phone: a?.phone || "",
             type: w.type, skill: w.skill || "Boilers", priority: w.priority,
-            requestedDate: w.requestedDate, requestedTime: w.requestedTime, durationMin: w.durationMin,
+            requestedDate: w.requestedDate, requestedTime: w.requestedTime, requestedSlot: w.requestedSlot, durationMin: w.durationMin,
             description: w.description, subject: w.subject, crmStatus: w.status,
+            createdBy: w.createdBy, createdAt: w.raisedAt,
           };
         });
         const out = JSON.stringify(Object.values(byWo));
@@ -189,9 +202,14 @@ export default function App({ currentUser }) {
         if (v && v !== syncedStore.current) { syncedStore.current = v; setData(JSON.parse(v)); }
       } catch (e) {}
     };
+    const loadTerr = async () => {
+      try { const r = await window.storage.get(TERRITORY_KEY); if (r && r.value) setTerritories(JSON.parse(r.value)); } catch (e) {}
+    };
+    loadTerr();
     const unsubStore = window.storage.subscribe(STORE_KEY, reloadStore);
     const unsubBridge = window.storage.subscribe(BRIDGE_KEY, () => pullDispatch());
-    return () => { unsubStore && unsubStore(); unsubBridge && unsubBridge(); };
+    const unsubTerr = window.storage.subscribe(TERRITORY_KEY, loadTerr);
+    return () => { unsubStore && unsubStore(); unsubBridge && unsubBridge(); unsubTerr && unsubTerr(); };
   }, [loaded]);
 
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 3200); };
@@ -230,7 +248,7 @@ export default function App({ currentUser }) {
     accounts: { name: "", type: ACCOUNT_TYPES[0], industry: "", phone: "", website: "", address: "", postcode: "", owner: "", rating: "Warm" },
     contacts: { accountId: accounts[0]?.id || "", name: "", title: "", email: "", phone: "" },
     opportunities: { accountId: accounts[0]?.id || "", name: "", stage: OPP_STAGES[0], amount: 0, closeDate: relDate(30) },
-    workorders: { accountId: accounts[0]?.id || "", contactId: null, subject: "", type: "Repair", skill: "Boilers", priority: "Routine", status: "Unscheduled", requestedDate: relDate(0), requestedTime: "09:00", durationMin: 60, description: "" },
+    workorders: { accountId: accounts[0]?.id || "", contactId: null, subject: "", type: "Repair", skill: "Boilers", priority: "Routine", status: "Unscheduled", requestedDate: relDate(0), requestedTime: "08:00", requestedSlot: "AM", durationMin: 60, description: "" },
     activity: { type: "Task", subject: "", date: todayISO(), done: false },
   };
   const openCreate = (object, preset = {}) => { setDraft({ ...defaults[object], ...preset }); setModal(object); };
@@ -247,7 +265,7 @@ export default function App({ currentUser }) {
       if (_editId) return { ...d, [object]: arr.map((r) => (r.id === _editId ? { ...r, ...rest } : r)) };
       const rec = { ...rest, id: object === "workorders" ? nextWoNumber(arr) : seqId(idPrefix[object], arr) };
       if (object === "accounts") rec.owner = userName;
-      if (object === "workorders") { rec.createdBy = userName; rec.durationMin = Number(rec.durationMin) || 60; }
+      if (object === "workorders") { rec.createdBy = userName; rec.durationMin = Number(rec.durationMin) || 60; rec.raisedAt = new Date().toISOString(); }
       if (object === "opportunities") rec.amount = Number(rec.amount) || 0;
       let next = { ...d, [object]: [rec, ...arr] };
       // raising a booking logs a note on the account and queues it for dispatch
@@ -255,7 +273,7 @@ export default function App({ currentUser }) {
         bookingAccount = rec.accountId;
         bookingNote = {
           id: "ACT-" + Math.random().toString(36).slice(2, 7), recordId: rec.accountId, type: "Note",
-          subject: `Booking raised — WO ${rec.id}: ${rec.subject || rec.type} (${rec.type} · ${rec.skill}, ${rec.priority}) for ${fmtDate(rec.requestedDate)} ${rec.requestedTime}`,
+          subject: `Booking raised — WO ${rec.id}: ${rec.subject || rec.type} (${rec.type} · ${rec.skill}, ${rec.priority}) for ${fmtDate(rec.requestedDate)} ${rec.requestedSlot === "PM" ? "13:00–18:00" : "08:00–12:00"}`,
           author: userName, at: new Date().toISOString(), done: true,
         };
         next = { ...next, activities: [bookingNote, ...next.activities] };
@@ -434,7 +452,7 @@ export default function App({ currentUser }) {
         ],
         details: [
           ["Account name", r.name], ["Type", r.type], ["Industry", r.industry], ["Phone", r.phone],
-          ["Website", r.website || "—"], ["Billing address", `${r.address}, ${r.postcode}`], ["Owner", r.owner], ["Rating", r.rating],
+          ["Website", r.website || "—"], ["Billing address", `${r.address}, ${r.postcode}`], ["Scheduling territory", territoryForPostcode(r.postcode, territories)?.name || "—"], ["Owner", r.owner], ["Rating", r.rating],
         ],
         related: [
           { object: "contacts", title: "Contacts", rows: cs, line: (c) => [c.name, c.title] },
@@ -686,7 +704,12 @@ export default function App({ currentUser }) {
         </div>
         <div className="grid grid-cols-3 gap-3">
           <Field label="Requested date"><input type="date" className={inputCls} value={draft.requestedDate} onChange={(e) => setF("requestedDate", e.target.value)} /></Field>
-          <Field label="Requested time"><input type="time" className={inputCls} value={draft.requestedTime} onChange={(e) => setF("requestedTime", e.target.value)} /></Field>
+          <Field label="Time slot">
+            <select className={inputCls} value={draft.requestedSlot || (draft.requestedTime >= "12:30" ? "PM" : "AM")} onChange={(e) => { const v = e.target.value; setF("requestedSlot", v); setF("requestedTime", v === "PM" ? "13:00" : "08:00"); }}>
+              <option value="AM">Morning · 08:00–12:00</option>
+              <option value="PM">Afternoon · 13:00–18:00</option>
+            </select>
+          </Field>
           <Field label="Duration (min)"><input type="number" step="15" className={inputCls} value={draft.durationMin} onChange={(e) => setF("durationMin", e.target.value)} /></Field>
         </div>
         <Field label="Description"><textarea rows={2} className={inputCls} value={draft.description} onChange={(e) => setF("description", e.target.value)} /></Field>
